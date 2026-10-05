@@ -2,11 +2,11 @@
 R code for the thesis: "Semi-Markov Models and Bayesian Methods in AFL"
 ## Data
 
-The AFL play-by-play data used in this project were obtained from the publicly available dataset compiled by Richard Little:
+The AFL play-by-play data used in this project was obtained from the publicly available dataset compiled by Richard Little:
 
 https://github.com/alittlefitness/afl_play_by_play
 
-The data were originally sourced from afl.com.au and cover the 2021 AFL season.
+The data was originally sourced from afl.com.au and covers the 2021 AFL season.
 
 ## Citation
 
