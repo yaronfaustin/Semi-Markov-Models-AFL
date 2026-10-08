@@ -1,0 +1,4860 @@
+---
+title: "AFLResearchProject_OnlineCopy"
+author: "Yaron Faustin"
+date: "2026-09-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Section 4.1 / 4.2
+## Load in the data + libraries
+
+Pretty self explanatory
+
+```{r library}
+library(readxl) #Used for read.csv
+library(lubridate) #Used for ms
+library(ggplot2) #GGplot
+library(MASS) #fitdistr
+library(fitdistrplus) #mledist
+library(dplyr) # %>%
+library(tidyr) #pivot_widers
+library(scales)
+library(pheatmap) # special heatmaps
+
+library(grid)
+library(mixtools) #for mixture fits
+library(nnet) # testing markov assumption
+library(stringr) # long-run
+library(tibble) # most common transitions
+```
+
+load in that data from 2021
+
+```{r data}
+#Load in 2021 data
+df1 <- read.csv("C:/~/AFL Play by play 1-12.csv")
+df2 <- read.csv("C:/~/AFL Play by play 13-27.csv")
+
+playbyplay <- rbind(df1, df2)
+```
+
+## Build pbp with all necessary features
+
+```{r build pbp}
+#TimeSec and dt
+pbp <- playbyplay %>%
+  mutate(
+    TimeSec = as.numeric(ms(Time))
+  ) %>%
+  group_by(Match_id, Quarter) %>%
+  mutate(
+    dt = lead(TimeSec) - TimeSec 
+  ) %>%
+  ungroup()
+
+#new_period
+pbp <- pbp %>%
+  group_by(Match_id) %>%
+  mutate(
+    new_period = Quarter != lag(Quarter, default = first(Quarter)),
+    new_period = ifelse(row_number() == 1, TRUE, new_period)
+  ) %>%
+  ungroup()
+
+# pos
+neutral_events <- c(
+  "Tackle","Spoil","Hitout",
+  "Hitout To Advantage","F 50 Tackle"
+)
+
+possession_events <- c(
+  "Poss Gain","Stoppage Clearance","Centre Clearance",
+  "Kick In","Intercept Mark","Kick","Handball",
+  "Free For","Mark","Ground Ball Get",
+  "Contested Possession","Uncontested Possession"
+)
+
+pbp <- pbp %>%
+  mutate(
+    pos = case_when(
+      Stat %in% neutral_events ~ "Neutral",
+      Stat %in% possession_events ~ Team_status,
+      TRUE ~ NA_character_
+    )
+  )
+
+pbp <- pbp %>%
+  group_by(Match_id) %>%
+  tidyr::fill(pos, .direction = "down") %>%
+  ungroup()
+
+#loc
+pbp <- pbp %>%
+  mutate(
+    loc = case_when(
+      #Quarter start
+      new_period ~ "M",
+      
+      # After score
+      Stat == "Goal"   ~ "G",
+      Stat == "Behind" ~ "B" , 
+      
+      #Trail after Goal
+      lag(Stat) == "Goal" ~ "M",
+      
+      # Kick-ins
+      Stat == "Kick In" & Team_status == "home" ~ "HK",
+      Stat == "Kick In" & Team_status == "away" ~ "AK",
+      
+      # Inside 50 entries
+      Stat == "Shot At Goal" & Team_status == "home" ~ "H50", 
+      #Somehow in50s arent tracked????
+      Stat == "Shot At Goal" & Team_status == "away" ~ "A50",
+      # Inside 50 entries (marks)
+      Stat == "F 50 Mark" & Team_status == "home" ~ "H50",
+      Stat == "F 50 Mark" & Team_status == "away" ~ "A50",
+      #F 50 Tackles
+      Stat == "F 50 Tackle" & Team_status == "home" ~ "H50",
+      Stat == "F 50 Tackle" & Team_status == "away" ~ "A50",
+      
+      #Inside 50 exits
+      Stat == "Rebound 50" ~ "M",
+      
+      # Clearances → midfield proxy
+      Stat %in% c("Centre Clearance") ~ "M",
+      
+      TRUE ~ NA_character_
+    )
+  )
+
+pbp <- pbp %>%
+  group_by(Match_id) %>%
+  tidyr::fill(loc, .direction = "down") %>%
+  ungroup()
+
+# pos_id
+pbp <- pbp %>%
+  group_by(Match_id) %>%
+  mutate(
+    pos_start = row_number() == 1 |
+                  pos != lag(pos),
+    pos_id = cumsum(pos_start)
+  ) %>%
+  ungroup()
+
+#infer from "rebound 50"
+
+# That the current chain is relocated
+pbp <- pbp %>%
+  group_by(Match_id, pos_id) %>%
+  mutate(row_in_chain = row_number()) %>%
+  ungroup()
+
+# Build rebound_info
+rebound_info <- pbp %>%
+  filter(Stat == "Rebound 50") %>%
+  group_by(Match_id, pos_id) %>%
+  summarise(
+    rebound_row = min(row_in_chain),
+    rebound_team = first(Team_status),
+    .groups = "drop"
+  )
+
+# Join ONCE
+pbp <- pbp %>%
+  select(-any_of(c("rebound_row", "rebound_team"))) %>%
+  left_join(rebound_info, by = c("Match_id","pos_id"))
+
+# Now mutate safely
+pbp <- pbp %>%
+  mutate(
+    loc = case_when(
+      !is.na(rebound_row) &
+      row_in_chain <= rebound_row &
+      rebound_team == "home" &
+      loc == "M" ~ "A50",
+
+      !is.na(rebound_row) &
+      row_in_chain <= rebound_row &
+      rebound_team == "away" &
+      loc == "M" ~ "H50",
+
+      TRUE ~ loc
+    )
+  )
+
+chain_rebound <- pbp %>%
+  group_by(Match_id, pos_id) %>%
+  summarise(
+    has_rebound = any(Stat == "Rebound 50"),
+    rebound_team = ifelse(
+      has_rebound,
+      first(Team_status[Stat == "Rebound 50"]),
+      NA_character_
+    ),
+    .groups = "drop"
+  )
+chain_rebound <- chain_rebound %>%
+  group_by(Match_id) %>%
+  mutate(
+    next_has_rebound = lead(has_rebound, default = FALSE),
+    next_rebound_team = lead(rebound_team)
+  ) %>%
+  ungroup()
+pbp <- pbp %>%
+  left_join(
+    chain_rebound %>%
+      select(Match_id, pos_id, next_rebound_team),
+    by = c("Match_id", "pos_id")
+  )
+pbp <- pbp %>%
+  mutate(
+    loc = case_when(
+      !is.na(next_rebound_team) &
+      pos == "Neutral" &
+      next_rebound_team == "home" &
+      loc == "M" ~ "A50",
+
+      !is.na(next_rebound_team) &
+      pos == "Neutral" &
+      next_rebound_team == "away" &
+      loc == "M" ~ "H50",
+
+      TRUE ~ loc
+    )
+  )
+
+#pos_and_loc
+pbp <- pbp %>%
+  mutate(
+    pos_and_loc = case_when(
+      
+      #Quarter start
+      new_period ~ "N_M",
+      lag(Stat) == "Goal" ~ "N_M",
+      
+                  # After score
+      Stat == "Goal"  & Team_status == "home" ~ "HG",
+      Stat == "Goal"  & Team_status == "away" ~ "AG",
+      Stat == "Behind"  & Team_status == "home" ~ "HB",
+      Stat == "Behind"  & Team_status == "away" ~ "AB",
+      
+      # Kick-ins
+      Stat == "Kick In" & Team_status == "home" ~ "HK",
+      Stat == "Kick In" & Team_status == "away" ~ "AK",
+      
+      #H50 
+      loc == "H50" & pos == "home" ~ "H_H50",
+      loc == "H50" & (pos == "Neutral") ~ "N_H50",
+      loc == "H50" & pos == "away" ~ "A_H50",
+      
+      #A50 
+      loc == "A50" & pos == "home" ~ "H_A50",
+      loc == "A50" & pos == "Neutral" ~ "N_A50",
+      loc == "A50" & pos == "away" ~ "A_A50",
+      
+      #M
+      loc == "M" & pos == "home" ~ "H_M",
+      (loc == "M") & pos == "Neutral" ~ "N_M",
+      (loc == "G") & pos == "Neutral" ~ "N_M", #Addressing G case
+      loc == "M" & pos == "away" ~ "A_M",
+      
+      TRUE ~ NA_character_
+    )
+  )
+
+pbp <- pbp %>%
+  group_by(Match_id) %>%
+  tidyr::fill(pos_and_loc, .direction = "down") %>%
+  ungroup()
+
+#state_change
+pbp <- pbp %>%
+  arrange(Match_id, Quarter, Time) %>%
+  group_by(Match_id) %>%
+  mutate(
+    state_change = pos_and_loc != lag(pos_and_loc, default = first(pos_and_loc))
+  ) %>%
+  ungroup()
+```
+
+## Build Chain Starts2
+```{r chain starts}
+# Create chain_starts matrix
+chain_starts <- pbp %>%
+  filter(state_change)
+
+chain_starts2 <- chain_starts %>%
+  group_by(Match_id, Quarter) %>%
+  mutate(
+    next_pos_and_loc = lead(pos_and_loc)
+  ) %>%
+  ungroup() #%>%
+  #filter(!is.na(next_pos_and_loc))
+
+# for discrete soujorn times
+
+chain_starts2<- chain_starts2%>%
+  group_by(Match_id, Quarter) %>%
+  mutate(
+    pos_and_loc_time = lead(TimeSec) - TimeSec
+  ) %>%
+  ungroup()
+
+# for individual game bayesian prediction model
+
+chain_starts2 <- chain_starts2 %>%
+  mutate(
+    pos_and_loc_time_adj = if_else(
+      ((startsWith(pos_and_loc, "N")) | (loc == "G") | (loc == "B") | is.na(pos_and_loc_time)),
+      0,
+      pos_and_loc_time
+    )
+  )
+
+chain_starts2 <- chain_starts2 %>%
+  group_by(Match_id) %>%
+  mutate(
+    match_time = cumsum(pos_and_loc_time_adj)
+  ) %>%
+  ungroup()
+
+```
+
+# Section 4.4
+
+#Discrete soujourn times
+```{r Discrete model soujourn times}
+#We need to also have the distributions of time spent in each state for all of those that actually cause game time to elapse
+
+discrete_chain_lengths <- chain_starts2%>%
+  select(Match_id, Home, pos_id, pos_and_loc, next_pos_and_loc, pos_and_loc_time) %>%
+  filter(pos_and_loc_time != 0) %>%
+  filter(pos_and_loc_time < 150)
+
+# Fit some gammas and exp to each of the ones that arent neutral
+df_times <- discrete_chain_lengths %>%
+  filter(pos_and_loc %in% c(
+    "A_A50","A_M","A_H50",
+    "H_A50","H_M","H_H50"
+  ))
+
+discrete_model_time_fits <- df_times %>%
+  group_by(pos_and_loc) %>%
+  summarise(
+    exp_rate = fitdistr(pos_and_loc_time, "exponential")$estimate["rate"],
+    gamma_shape = fitdistr(pos_and_loc_time, "gamma")$estimate["shape"],
+    gamma_rate  = fitdistr(pos_and_loc_time, "gamma")$estimate["rate"]
+  )
+
+# Lets plot these fits to see how good they are:
+densities <- discrete_model_time_fits %>%
+  rowwise() %>%
+  do({
+    state <- .$pos_and_loc
+    times <- seq(0, 150, length.out = 200)
+    
+    data.frame(
+      pos_and_loc = state,
+      time = times,
+      exp_density = dexp(times, rate = .$exp_rate),
+      gamma_density = dgamma(times, shape = .$gamma_shape, rate = .$gamma_rate)
+    )
+  })
+
+p <- ggplot(df_times, aes(x = pos_and_loc_time)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 50,
+    fill = "grey85",
+    color = "grey30",
+    linewidth = 0.2
+  ) +
+  geom_line(
+    data = densities,
+    aes(x = time, y = gamma_density, color = "Gamma Fit"),
+    linewidth = 1
+  ) +
+  facet_wrap(
+    ~ pos_and_loc,
+    scales = "free_y"
+  ) +
+  coord_cartesian(xlim = c(0, 75)) +
+  labs(
+    title = "Holding Time Distributions by State",
+    x = "Holding Time (seconds)",
+    y = "Density",
+    color = "Distribution"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 14,
+      hjust = 0.5
+    ),
+    strip.text = element_text(
+      face = "bold",
+      size = 11
+    ),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 9),
+    legend.position = "top",
+    legend.title = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+p
+
+#______________________________________________________________________________
+# Make a plot of with the next state included
+
+p <- ggplot(
+  df_times,
+  aes(
+    x = pos_and_loc_time,
+    fill = next_pos_and_loc
+  )
+) +
+  geom_bar() +
+  facet_wrap(
+    ~ pos_and_loc,
+    scales = "free_y",
+    ncol = 2
+  ) +
+  coord_cartesian(xlim = c(0, 75)) +
+  labs(
+    title = "Holding Times by Current and Next State",
+    x = "Holding Time (seconds)",
+    y = "Count",
+    fill = "Next State"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 14,
+      hjust = 0.5
+    ),
+    strip.text = element_text(
+      face = "bold",
+      size = 11
+    ),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 9),
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+p
+
+```
+
+# Mixture fits for A_A50 and H_H50
+```{r gamma mixtures}
+
+# Extract times for the attacking states
+H_H50_times <- chain_starts2 %>%
+  filter(
+    pos_and_loc == "H_H50",
+    pos_and_loc_time > 0,
+    pos_and_loc_time < 70
+  ) %>%
+  pull(pos_and_loc_time)
+
+A_A50_times <- chain_starts2 %>%
+  filter(
+    pos_and_loc == "A_A50",
+    pos_and_loc_time > 0,
+    pos_and_loc_time < 70
+  ) %>%
+  pull(pos_and_loc_time)
+
+# Fit via EM Algorithm
+H_H50_fit_mix <- gammamixEM(
+  H_H50_times,
+  k = 2,
+  maxit = 5000,
+  epsilon = 1e-8
+)
+
+cat("Gamma Params H_H50:")
+H_H50_fit_mix$gamma.pars
+cat("Weights H_H50:")
+H_H50_fit_mix$lambda
+
+A_A50_fit_mix <- gammamixEM(
+  A_A50_times,
+  k = 2,
+  maxit = 5000,
+  epsilon = 1e-8
+)
+
+cat("Gamma Params A_A50:")
+A_A50_fit_mix$gamma.pars
+cat("Weights A_A50:")
+A_A50_fit_mix$lambda
+
+# Function to generate mixture density data
+get_gamma_mixture_density <- function(times, fit, state) {
+  
+  x <- seq(0, max(times), length.out = 1000)
+  
+  alpha1 <- fit$gamma.pars["alpha", "comp.1"]
+  beta1  <- fit$gamma.pars["beta", "comp.1"]
+  
+  alpha2 <- fit$gamma.pars["alpha", "comp.2"]
+  beta2  <- fit$gamma.pars["beta", "comp.2"]
+  
+  lambda1 <- fit$lambda[1]
+  lambda2 <- fit$lambda[2]
+  
+  f1 <- dgamma(x, shape = alpha1, scale = beta1)
+  f2 <- dgamma(x, shape = alpha2, scale = beta2)
+  
+  data.frame(
+    time = x,
+    component_1 = lambda1 * f1,
+    component_2 = lambda2 * f2,
+    mixture = lambda1 * f1 + lambda2 * f2,
+    state = state
+  )
+}
+
+H_H50_density <- get_gamma_mixture_density(
+  H_H50_times,
+  H_H50_fit_mix,
+  "H_H50"
+)
+
+A_A50_density <- get_gamma_mixture_density(
+  A_A50_times,
+  A_A50_fit_mix,
+  "A_A50"
+)
+
+mixture_densities <- rbind(
+  H_H50_density,
+  A_A50_density
+)
+
+mixture_times <- rbind(
+  data.frame(
+    time = H_H50_times,
+    state = "H_H50"
+  ),
+  data.frame(
+    time = A_A50_times,
+    state = "A_A50"
+  )
+)
+
+# Nice plot
+p_mixture <- ggplot(mixture_times, aes(x = time)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 70,
+    fill = "grey85",
+    color = "grey30",
+    linewidth = 0.2
+  ) +
+  geom_line(
+    data = mixture_densities,
+    aes(
+      x = time,
+      y = mixture,
+      linetype = "Mixture"
+    ),
+    linewidth = 1,
+    colour = "red"
+  ) +
+  facet_wrap(~ state, scales = "free_y") +
+  coord_cartesian(xlim = c(0, 75)) +
+  labs(
+    title = "Gamma Mixture Fits for Selected Holding Time Distributions",
+    x = "Holding Time (seconds)",
+    y = "Density",
+    linetype = "Distribution"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 14,
+      hjust = 0.5
+    ),
+    strip.text = element_text(
+      face = "bold",
+      size = 11
+    ),
+    legend.position = "top",
+    legend.title = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+p_mixture
+
+```
+
+
+
+# Section 5.1
+## Build transition matrix
+
+```{r transition matrix}
+
+# Transition counts
+transition_counts <- table(
+  chain_starts2$pos_and_loc,
+  chain_starts2$next_pos_and_loc
+)
+
+transition_probs3 <- prop.table(transition_counts, margin = 1)
+
+# New order for the heatmap
+new_order <- c(
+  "HG", "HB", "AK",
+  "H_H50", "N_H50", "A_H50",
+  "H_M", "N_M", "A_M",
+  "H_A50", "N_A50", "A_A50",
+  "HK", "AB", "AG"
+)
+
+transition_probs3 <- transition_probs3[new_order, new_order]
+
+# Heatmap
+display_matrix <- matrix(
+  sprintf("%.2f", transition_probs3),
+  nrow = nrow(transition_probs3),
+  dimnames = dimnames(transition_probs3)
+)
+display_matrix[transition_probs3 == 0] <- "0"
+
+plot_data <- as.data.frame(as.table(transition_probs3))
+colnames(plot_data) <- c("From", "To", "Probability")
+
+# Force rows and columns to use the same ordering
+state_order <- rownames(transition_probs3)
+
+plot_data$From <- factor(plot_data$From, levels = rev(state_order))
+plot_data$To <- factor(plot_data$To, levels = state_order)
+
+# Labels for probabilities
+plot_data$Label <- sprintf("%.2f", plot_data$Probability)
+plot_data$Label[plot_data$Probability == 0] <- "0"
+
+p <- ggplot(plot_data, aes(x = To, y = From, fill = Probability)) +
+  geom_tile(colour = "grey80", linewidth = 0.3) +
+  geom_text(aes(label = Label), size = 4) +
+  scale_fill_gradientn(
+    colours = c("white", "lightsteelblue1", "steelblue1")
+  ) +
+  scale_x_discrete(position = "bottom") +
+  scale_y_discrete(position = "left") +
+  coord_fixed() +
+  theme_minimal() +
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 10),
+    legend.position = "none",
+    panel.grid = element_blank()
+  ) +
+  labs(
+    title = "Empirical AFL State Transition Matrix (Full 2021 Season Data)"
+  )
+p
+```
+
+## Sd of each transition game to game
+
+We want to investigate how confident we are in this fit. How much it varies game to game.
+
+```{r sd of transitions}
+
+game_transitions <- chain_starts2 %>%
+  filter(!is.na(next_pos_and_loc)) %>%
+  count(Match_id, pos_and_loc, next_pos_and_loc) %>%
+  group_by(Match_id, pos_and_loc) %>%
+  mutate(p = n / sum(n)) %>%
+  ungroup()
+
+games <- unique(game_transitions$Match_id)
+states <- sort(unique(c(game_transitions$pos_and_loc,
+                        game_transitions$next_pos_and_loc)))
+
+P_list <- lapply(games, function(g) {
+
+  df_g <- game_transitions %>% filter(Match_id == g)
+
+  mat <- matrix(0,
+                nrow = length(states),
+                ncol = length(states),
+                dimnames = list(states, states))
+
+  for (i in seq_len(nrow(df_g))) {
+    mat[df_g$pos_and_loc[i], df_g$next_pos_and_loc[i]] <- df_g$p[i]
+  }
+
+  mat
+})
+
+names(P_list) <- games
+
+P_array <- array(0,
+                 dim = c(length(states), length(states), length(games)),
+                 dimnames = list(states, states, games))
+
+for (k in seq_along(games)) {
+  P_array[,,k] <- P_list[[k]]
+}
+
+P_mean <- apply(P_array, c(1,2), mean, na.rm = TRUE)
+P_sd <- apply(P_array, c(1,2), sd, na.rm = TRUE)
+
+P_mean <- P_mean[new_order, new_order]
+P_sd <- P_sd[new_order, new_order]
+
+#new version of the plot for sds
+plot_data <- as.data.frame(as.table(P_sd))
+colnames(plot_data) <- c("From", "To", "SD")
+
+# Force rows and columns to use the same ordering
+state_order <- rownames(P_sd)
+
+plot_data$From <- factor(plot_data$From, levels = rev(state_order))
+plot_data$To <- factor(plot_data$To, levels = state_order)
+
+# Labels for standard deviations
+plot_data$Label <- sprintf("%.2f", plot_data$SD)
+plot_data$Label[plot_data$SD == 0] <- "0"
+
+p <- ggplot(plot_data, aes(x = To, y = From, fill = SD)) +
+  geom_tile(colour = "grey80", linewidth = 0.3) +
+  geom_text(aes(label = Label), size = 4) +
+  scale_fill_gradientn(
+    colours = c("white", "lightsteelblue1", "steelblue1")
+  ) +
+  scale_x_discrete(position = "bottom") +
+  scale_y_discrete(position = "left") +
+  coord_fixed() +
+  theme_minimal() +
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 10),
+    legend.position = "none",
+    panel.grid = element_blank()
+  ) +
+  labs(
+    title = "Standard Deviation of Transition Probabilities over Matches"
+  )
+
+p
+
+```
+
+# Section 5.2
+## Test the Markov assumption
+```{r test the markov assumption}
+# Prepare the data
+# Create triples (Previous, Current, Next) within each
+# Match_id and Quarter so that no transitions cross quarters.
+
+test_data <- chain_starts2 %>%
+  group_by(Match_id, Quarter) %>%
+  mutate(
+    Previous = lag(pos_and_loc, 1),
+    Current = pos_and_loc,
+    Next = lead(pos_and_loc, 1)
+  ) %>%
+  ungroup() %>%
+  filter(
+    !is.na(Previous),
+    !is.na(Next)
+  ) %>%
+  select(Match_id, Quarter, Previous, Current, Next)
+
+
+# Make sure the variables are factors
+test_data <- test_data %>%
+  mutate(
+    Previous = factor(Previous),
+    Current = factor(Current),
+    Next = factor(Next)
+  )
+
+# ============================================================
+# First-order multinomial model
+model_1 <- multinom(
+  Next ~ Current,
+  data = test_data,
+  trace = FALSE
+)
+
+# ============================================================
+# Second-order multinomial model
+model_2 <- multinom(
+  Next ~ Previous + Current,
+  data = test_data,
+  trace = FALSE
+)
+
+# ============================================================
+# Likelihood-ratio test
+# Compare the log-likelihoods of the two models.
+
+logLik(model_1)
+logLik(model_2)
+
+G2_reg <- 2 * (
+  as.numeric(logLik(model_2)) -
+  as.numeric(logLik(model_1))
+)
+
+G2_reg
+
+
+# Degrees of freedom = difference in number of free parameters
+
+df_reg <- attr(logLik(model_2), "df") -
+          attr(logLik(model_1), "df")
+
+df_reg
+
+
+# Chi-squared p-value
+
+p_value_reg <- pchisq(
+  G2_reg,
+  df = df_reg,
+  lower.tail = FALSE
+)
+
+p_value_reg
+
+# ============================================================
+# Display the main test results
+
+cat("First-order model parameters:", attr(logLik(model_1), "df"), "\n")
+cat("Second-order model parameters:", attr(logLik(model_2), "df"), "\n")
+cat("Degrees of freedom:", df_reg, "\n")
+cat("Likelihood-ratio statistic:", G2_reg, "\n")
+cat("p-value:", p_value_reg, "\n")
+
+```
+
+## Version with fixed zeroes 
+```{r version with fixed zeroes}
+#=============================================================
+# First-order empirical probabilities
+
+first_order <- test_data %>%
+  count(Current, Next, name = "N_ij") %>%
+  group_by(Current) %>%
+  mutate(
+    N_i = sum(N_ij),
+    p_ij = N_ij / N_i
+  ) %>%
+  ungroup()
+
+
+# Second-order empirical probabilities
+
+second_order <- test_data %>%
+  count(Previous, Current, Next, name = "N_kij") %>%
+  group_by(Previous, Current) %>%
+  mutate(
+    N_ki = sum(N_kij),
+    p_kij = N_kij / N_ki
+  ) %>%
+  ungroup()
+
+
+df_first <- first_order %>%
+  group_by(Current) %>%
+  summarise(
+    n_next = n(),
+    .groups = "drop"
+  ) %>%
+  summarise(
+    df = sum(n_next - 1)
+  ) %>%
+  pull(df)
+
+
+df_second <- second_order %>%
+  group_by(Previous, Current) %>%
+  summarise(
+    n_next = n(),
+    .groups = "drop"
+  ) %>%
+  summarise(
+    df = sum(n_next - 1)
+  ) %>%
+  pull(df)
+
+
+df_direct <- df_second - df_first
+
+# Match the first-order probabilities to the
+# corresponding second-order transitions.
+
+lr_data <- second_order %>%
+  left_join(
+    first_order %>%
+      select(Current, Next, p_ij),
+    by = c("Current", "Next")
+  )
+
+
+# Direct likelihood-ratio statistic
+
+G2_direct <- 2 * sum(
+  lr_data$N_kij *
+    log(lr_data$p_kij / lr_data$p_ij)
+)
+
+G2_direct
+
+
+p_value_direct <- pchisq(
+  G2_direct,
+  df = df_direct,
+  lower.tail = FALSE
+)
+p_value_direct
+
+cat("Direct first-order parameters:", df_first, "\n")
+cat("Direct second-order parameters:", df_second, "\n")
+
+```
+
+
+## Find relative improvement
+```{r relative improvement}
+set.seed(123)
+
+matches <- unique(test_data$Match_id)
+
+train_matches <- sample(
+  matches,
+  size = 0.8 * length(matches)
+)
+
+train_data <- test_data %>%
+  filter(Match_id %in% train_matches)
+
+test_data_cv <- test_data %>%
+  filter(!Match_id %in% train_matches)
+
+model_1_cv <- multinom(
+  Next ~ Current,
+  data = train_data,
+  trace = FALSE
+)
+
+model_2_cv <- multinom(
+  Next ~ Previous + Current,
+  data = train_data,
+  trace = FALSE
+)
+
+pred_1 <- predict(
+  model_1_cv,
+  test_data_cv,
+  type = "probs"
+)
+
+pred_2 <- predict(
+  model_2_cv,
+  test_data_cv,
+  type = "probs"
+)
+
+p1 <- pred_1[
+  cbind(
+    seq_len(nrow(test_data_cv)),
+    match(test_data_cv$Next, colnames(pred_1))
+  )
+]
+
+p2 <- pred_2[
+  cbind(
+    seq_len(nrow(test_data_cv)),
+    match(test_data_cv$Next, colnames(pred_2))
+  )
+]
+
+log_loss_1 <- -mean(log(p1))
+log_loss_2 <- -mean(log(p2))
+
+log_loss_improvement <- log_loss_1 - log_loss_2
+
+relative_improvement <- (
+  log_loss_improvement / log_loss_1
+) * 100
+
+log_loss_1
+log_loss_2
+log_loss_improvement
+relative_improvement
+
+exp(log_loss_improvement)*100
+
+```
+
+# Section 5.3/ 5.4
+
+## Long run behaviour of transition matrix
+```{r limiting behaviour of discrete model}
+
+#Split P into fast and slow states
+P <- transition_probs3
+
+# identify fast and slow states
+fast_states <- c("AB", "AG", "HB", "HG", "N_M", "N_H50", "N_A50", "AK", "HK")
+slow_states <- setdiff(rownames(P), fast_states)
+
+# partition P
+P_ss <- P[slow_states, slow_states]
+P_sf <- P[slow_states, fast_states]
+P_fs <- P[fast_states, slow_states]
+P_ff <- P[fast_states, fast_states]
+
+# reduced transition matrix
+P_reduced <- P_ss + P_sf %*% solve(diag(length(fast_states)) - P_ff) %*% P_fs
+
+#round(P_reduced, 4)
+
+#Long run probabilites
+A <- t(P) - diag(nrow(P))
+A[nrow(A), ] <- 1   # replace last equation with sum constraint
+
+b <- rep(0, nrow(P))
+b[length(b)] <- 1
+
+pi <- solve(A, b)
+
+print('Here is the steady state:')
+round(pi,4)
+
+pi_full <- pi
+
+# New plot:
+steady_state_df <- tibble(
+  state = rownames(P),
+  pi = as.numeric(pi)
+) %>%
+  mutate(
+    possession = case_when(
+    str_detect(state, "^N") ~ "Neutral",
+    str_detect(state, "^H") ~ "Home",
+    str_detect(state, "^A") ~ "Away",
+    TRUE ~ "Other"
+    )
+  ) %>%
+  arrange(desc(pi)) %>%
+  mutate(state = factor(state, levels = state))
+
+steady_state_plot <- ggplot(steady_state_df, aes(x = pi, y = state, fill = possession)) +
+  geom_col() +
+  geom_text(
+    aes(label = scales::percent(pi, accuracy = 0.1)),
+    hjust = -0.1,
+    size = 3.5
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Neutral" = "forestgreen",
+      "Home" = "firebrick",
+      "Away" = "steelblue",
+      "Other" = "grey70"
+    )
+  ) +
+  scale_x_continuous(
+    labels = scales::percent,
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Steady-state distribution of possession-location states",
+    subtitle = "Long-run proportion of transitions expected in each state",
+    x = "Steady-state probability",
+    y = NULL,
+    fill = "Possession"
+  ) +
+  theme_minimal()
+
+steady_state_plot
+
+P <- P_reduced
+
+A <- t(P) - diag(nrow(P))
+A[nrow(A), ] <- 1   # replace last equation with sum constraint
+
+b <- rep(0, nrow(P))
+b[length(b)] <- 1
+
+pi <- solve(A, b)
+
+gamma_means <- with(discrete_model_time_fits, gamma_shape / gamma_rate)
+names(gamma_means) <- discrete_model_time_fits$pos_and_loc
+
+# update the means for the mixture states
+A_A50_mean <- sum(
+  A_A50_fit_mix$lambda *
+  A_A50_fit_mix$gamma.pars["alpha", ] *
+  A_A50_fit_mix$gamma.pars["beta", ]
+)
+
+H_H50_mean <- sum(
+  H_H50_fit_mix$lambda *
+  H_H50_fit_mix$gamma.pars["alpha", ] *
+  H_H50_fit_mix$gamma.pars["beta", ]
+)
+
+gamma_means["A_A50"] <- A_A50_mean
+gamma_means["H_H50"] <- H_H50_mean
+
+
+gamma_means_full <- gamma_means[names(pi)]
+gamma_means_full[is.na(gamma_means_full)] <- 0
+
+weighted_times <- gamma_means_full * pi
+
+prop_times <- weighted_times / sum(weighted_times)
+print("Proportion of time in each state:")
+round(prop_times,3)
+
+prop_times_df <- tibble(
+  state = names(prop_times),
+  prop_time = as.numeric(prop_times)
+) %>%
+  mutate(
+    possession = case_when(
+      str_detect(state, "^N") ~ "Neutral",
+      str_detect(state, "^H") ~ "Home",
+      str_detect(state, "^A") ~ "Away",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  arrange(desc(prop_time)) %>%
+  mutate(state = factor(state, levels = state))
+
+prop_time_plot <- ggplot(
+  prop_times_df,
+  aes(x = prop_time, y = state, fill = possession)
+) +
+  geom_col() +
+  geom_text(
+    aes(label = scales::percent(prop_time, accuracy = 0.1)),
+    hjust = -0.1,
+    size = 3.5
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Neutral" = "forestgreen",
+      "Home" = "firebrick",
+      "Away" = "steelblue",
+      "Other" = "grey70"
+    )
+  ) +
+  scale_x_continuous(
+    labels = scales::percent,
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Proportion of time spent in each state",
+    x = "Proportion of total time",
+    y = NULL,
+    fill = "Possession"
+  ) +
+  theme_minimal()
+
+prop_time_plot
+
+# make the ordering match lol
+gamma_means_ordered <- gamma_means[names(prop_times)]
+
+game_time <- 4 * 20 * 60
+
+# Visit rates for slow states
+visit_rate_slow <- prop_times / gamma_means_ordered
+
+# Compute first-passage visits matrix F
+F <- solve(diag(length(fast_states)) - P_ff) %*% P_fs
+
+# Expected visits to fast states
+expected_visits_slow <- visit_rate_slow * 4* 20 * 60 # your slow states
+expected_visits_fast <- as.vector(expected_visits_slow %*% P_sf %*% solve(diag(length(fast_states)) - P_ff))
+names(expected_visits_fast) <- fast_states
+
+# Visit rates for fast states
+visit_rate_fast <- expected_visits_fast / game_time
+
+# Combine
+visit_rate <- c(visit_rate_slow, visit_rate_fast)
+
+# Put states in the same order as P
+visit_rate <- visit_rate[rownames(transition_probs3)]
+
+print("Visit rate:")
+round(visit_rate, 5)
+
+visit_rate_df <- tibble(
+  state = names(visit_rate),
+  visit_rate = as.numeric(visit_rate)
+) %>%
+  mutate(
+    possession = case_when(
+      str_detect(state, "^N") ~ "Neutral",
+      str_detect(state, "^H") ~ "Home",
+      str_detect(state, "^A") ~ "Away",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  arrange(desc(visit_rate)) %>%
+  mutate(state = factor(state, levels = state))
+
+visit_rate_plot <- ggplot(
+  visit_rate_df,
+  aes(x = visit_rate, y = state, fill = possession)
+) +
+  geom_col() +
+  geom_text(
+    aes(label = round(visit_rate, 4)),
+    hjust = -0.1,
+    size = 3.5
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Neutral" = "forestgreen",
+      "Home" = "firebrick",
+      "Away" = "steelblue",
+      "Other" = "grey70"
+    )
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Visit rate by possession-location state",
+    x = "Visit rate (visits per second)",
+    y = NULL,
+    fill = "Possession"
+  ) +
+  theme_minimal()
+
+visit_rate_plot
+
+
+names(expected_visits_fast) <- fast_states
+print("Expected visits:")
+expected_visits <- c(
+  expected_visits_slow,
+  expected_visits_fast
+)
+
+expected_visits <- expected_visits[rownames(transition_probs3)]
+
+round(expected_visits, 2)
+
+expected_visits_df <- tibble(
+  state = names(expected_visits),
+  expected_visits = as.numeric(expected_visits)
+) %>%
+  mutate(
+    possession = case_when(
+      str_detect(state, "^N") ~ "Neutral",
+      str_detect(state, "^H") ~ "Home",
+      str_detect(state, "^A") ~ "Away",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  arrange(desc(expected_visits)) %>%
+  mutate(state = factor(state, levels = state))
+
+expected_visits_plot <- ggplot(
+  expected_visits_df,
+  aes(x = expected_visits, y = state, fill = possession)
+) +
+  geom_col() +
+  geom_text(
+    aes(label = round(expected_visits, 1)),
+    hjust = -0.1,
+    size = 3.5
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Neutral" = "forestgreen",
+      "Home" = "firebrick",
+      "Away" = "steelblue",
+      "Other" = "grey70"
+    )
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Expected number of visits by possession-location state",
+    x = "Expected number of visits per game",
+    y = NULL,
+    fill = "Possession"
+  ) +
+  theme_minimal()
+
+expected_visits_plot
+
+(expected_score <- c(expected_visits_fast["HG"]*6+ expected_visits_fast["HB"],
+                     expected_visits_fast["AG"]*6+expected_visits_fast["AB"]))
+
+```
+
+##Gamma_params for pooled data simulation
+```{r gamma params update}
+
+gamma_params_wmix <- list()
+
+gamma_params_wmix$A_A50 <- list(
+  type = "gamma_mixture",
+  alpha = A_A50_fit_mix$gamma.pars["alpha", ],
+  beta = A_A50_fit_mix$gamma.pars["beta", ],
+  lambda = A_A50_fit_mix$lambda
+)
+
+gamma_params_wmix$H_H50 <- list(
+  type = "gamma_mixture",
+  alpha = H_H50_fit_mix$gamma.pars["alpha", ],
+  beta = H_H50_fit_mix$gamma.pars["beta", ],
+  lambda = H_H50_fit_mix$lambda
+)
+
+gamma_params_wmix$A_H50 <- list(
+  type = "gamma",
+  shape = discrete_model_time_fits$gamma_shape[
+    discrete_model_time_fits$pos_and_loc == "A_H50"
+  ],
+  rate = discrete_model_time_fits$gamma_rate[
+    discrete_model_time_fits$pos_and_loc == "A_H50"
+  ]
+)
+
+gamma_params_wmix$A_M <- list(
+  type = "gamma",
+  shape = discrete_model_time_fits$gamma_shape[
+    discrete_model_time_fits$pos_and_loc == "A_M"
+  ],
+  rate = discrete_model_time_fits$gamma_rate[
+    discrete_model_time_fits$pos_and_loc == "A_M"
+  ]
+)
+
+gamma_params_wmix$H_A50 <- list(
+  type = "gamma",
+  shape = discrete_model_time_fits$gamma_shape[
+    discrete_model_time_fits$pos_and_loc == "H_A50"
+  ],
+  rate = discrete_model_time_fits$gamma_rate[
+    discrete_model_time_fits$pos_and_loc == "H_A50"
+  ]
+)
+
+gamma_params_wmix$H_M <- list(
+  type = "gamma",
+  shape = discrete_model_time_fits$gamma_shape[
+    discrete_model_time_fits$pos_and_loc == "H_M"
+  ],
+  rate = discrete_model_time_fits$gamma_rate[
+    discrete_model_time_fits$pos_and_loc == "H_M"
+  ]
+)
+
+gamma_params_wmix
+
+
+
+```
+
+## Pooled data simulation function
+```{r simulate_discrete_gamma}
+simulate_discrete_gamma <- function(P_list, gamma_params) {
+  
+  current_state <- "N_M"
+  home <- 0
+  away <- 0
+  t <- 0
+  quarter_time <- 20*60
+  
+  # Initialize counters
+  total_times <- setNames(rep(0, length(names(P_list))), names(P_list))
+  visit_counts <- setNames(rep(0, length(names(P_list))), names(P_list))
+  
+  states <- c(current_state)
+  times <- c(0)
+  home_score <- c(0)
+  away_score <- c(0)
+  
+  for (q in 1:4){
+    
+    current_state <- "N_M"
+    t <- 0
+    
+    while (t < quarter_time) {
+      
+      params <- gamma_params[[current_state]]
+
+      # if rate is NA or 0, force dt = 0
+      if(is.null(params)){
+        dt <- 0
+      } else if (params$type == "gamma") {
+        dt <- rgamma(1,shape = params$shape, rate = params$rate)
+      } else if (params$type == "gamma_mixture") {
+        component <- sample(
+          1:length(params$lambda),
+          size = 1,
+          prob = params$lambda
+        )
+        dt <- rgamma(
+          1,
+          shape = params$alpha[component],
+          scale = params$beta[component]
+        )
+      } else {
+        # BIG ERROR
+        stop("Unknown distribution type: ", params$type)
+      }
+      
+             # Track time and visits 
+      if(t + dt < quarter_time){
+        total_times[current_state] <- total_times[current_state] + dt
+      }else {
+        total_times[current_state] <- total_times[current_state] + (quarter_time - t)
+      }
+      
+      visit_counts[current_state] <- visit_counts[current_state] + 1
+      
+      #Update score
+      if (current_state == "HG"){
+        home <- home + 6
+      }
+      if (current_state == "HB"){
+        home <- home + 1
+      }
+      if (current_state == "AG"){
+        away <- away + 6
+      }
+      if (current_state == "AB"){
+        away <- away + 1
+      }
+      
+      
+      t <- t + dt
+      if (t > quarter_time) break
+      
+      # sample next state
+      next_info <- P_list[[current_state]]
+      next_state <- sample(next_info$next_states, size = 1, prob = next_info$probs)
+      
+      current_state <- next_state
+    }
+  
+  }
+  
+  return(
+  data.frame(
+    pos_and_loc = names(P_list),
+    total_time = total_times,
+    visits = visit_counts
+  
+  )
+  )
+}
+
+
+```
+
+##Pooled data model simulations
+```{r Discrete model simulation}
+
+set.seed(1223)
+
+# Make sure rownames are the current states
+states <- rownames(transition_probs3)
+
+# convert transition matrix into list
+P_list <- lapply(states, function(st) {
+  probs <- transition_probs3[st, ]
+  next_states <- names(probs)
+  prob_vals <- as.numeric(probs)
+  
+  # remove 0-probabilities
+  next_states <- next_states[prob_vals > 0]
+  prob_vals <- prob_vals[prob_vals > 0]
+  
+  list(next_states = next_states, probs = prob_vals)
+})
+names(P_list) <- states
+
+#Make a gamma model
+
+gamma_params <- discrete_model_time_fits %>%
+  dplyr::select(pos_and_loc, gamma_shape, gamma_rate) %>%
+  split(.$pos_and_loc) %>%
+  lapply(function(row) {
+    list(
+      shape = row$gamma_shape,
+      rate  = row$gamma_rate
+    )
+  })
+
+# Run multiple simulations and average
+n <- 50000
+sim_results <- replicate(n, simulate_discrete_gamma(P_list, gamma_params_wmix), simplify=FALSE)
+sim_results_df <- bind_rows(sim_results, .id = "sim_id")
+
+# Average per state across simulations
+sim_summary <- sim_results_df %>%
+  group_by(pos_and_loc) %>%
+  summarise(
+    mean_total_time = mean(total_time),
+    mean_visits = mean(visits),
+    sd_of_mean_visits = sd(visits)/sqrt(n),
+    .groups = "drop"
+  )
+
+sim_summary
+score <- c(sim_summary$mean_visits[7]+sim_summary$mean_visits[8]*6,
+           sim_summary$mean_visits[1]+sim_summary$mean_visits[2]*6)
+score
+ 
+# Compare to the actual values 79.8 and 75.4
+
+```
+
+# Section 5.5
+## Investigate rate of convergence of transition matrix to steady state
+
+```{r rate of convergence of transition matrix}
+
+P <- transition_probs3
+#Compute Eigenvalues
+eigens <- eigen(transition_probs3)
+abs(eigens$values)
+
+# Second largest eigenvalue
+(rho <- abs(eigens$values[2]))
+#(rho <- sort(Mod(eigens$values), decreasing = TRUE)[2])
+
+# Diagonalise P
+V <- eigens$vectors
+Lambda <- diag(eigens$values)
+V_inv <- solve(V)
+
+
+# Derivation of the proper feller bound
+# Identify the eigenvalue indices corresponding to 1 and 0
+one_idx <- which.min(abs(eigens$values - 1))
+zero_idx <- which.min(abs(eigens$values))
+
+# Eigenvalues contributing to the convergence terms
+convergence_idx <- setdiff(
+  seq_along(eigens$values),
+  c(one_idx, zero_idx)
+)
+
+# Construct b^(v) matrices
+B <- lapply(seq_along(eigens$values), function(v) {
+  outer(V[, v], V_inv[v, ])
+})
+
+# C_jk = sum_v |b_jk^(v)|, excluding lambda = 1 and lambda = 0
+C_jk <- Reduce(
+  `+`,
+  lapply(convergence_idx, function(v) abs(B[[v]]))
+)
+
+# Feller constant
+C_Feller <- max(rowSums(C_jk))
+
+B_one <- outer(V[, one_idx], V_inv[one_idx, ])
+
+print("Constant C:")
+C_Feller
+
+initial_state <- rep(0, 15)
+initial_state[8] <- 1
+
+num_iterations <- 30
+
+error <- rep(NA,num_iterations)
+
+for(i in 1:num_iterations){
+  Pn <- diag(15)
+  for(j in 1:i){
+    Pn <- Pn %*% P
+  }
+
+  error[i] <- norm(initial_state %*% Pn - pi_full, type = "I")
+}
+
+# ============================================================
+# Compute values for Fill bounds
+
+P <- transition_probs3
+pi <- pi_full
+
+# D_pi
+D_pi <- diag(pi)
+
+# Adjoint of P in L^2(pi)
+P_star <- solve(D_pi) %*% t(P) %*% D_pi
+
+# Multiplicative reversibilisation
+M <- P %*% P_star
+
+# Eigenvalues of P*P
+eigens_M <- eigen(M)
+lambda_M <- sort(Re(eigens_M$values), decreasing = TRUE)
+
+# Second-largest eigenvalue of P*P
+beta2 <- lambda_M[2]
+
+print("Sqrt(Beta_M):")
+sqrt(beta2)
+
+# pi_min
+pi_min <- min(pi)
+
+print("sqrt(Pi_min)")
+sqrt(pi_min)
+
+# Fill's theoretical bound
+fill_bound <- beta2^(1:num_iterations/2) / sqrt(pi_min)
+
+#=============================================================================
+# New Fill bound in terms of A(P)
+
+A <- (P + P_star) / 2
+
+eigen_A <- eigen(A)
+
+beta_a <- sort(Re(eigen_A$values), decreasing = TRUE)[2]
+
+print("Sqrt(Beta_A):")
+sqrt(beta_a)
+
+fill_bound_A <- beta_a^(1:num_iterations/2) / sqrt(pi_min)
+
+
+#=====================================================================
+
+# Create data frame for plotting
+bound_data <- data.frame(
+  n = 1:num_iterations,
+  Empirical = error,
+  Feller = C_Feller * rho^(1:num_iterations),
+  Fill_M = fill_bound,
+  Fill_A = fill_bound_A
+)
+
+# Theoretical bounds in long format
+bound_data_long <- reshape(
+  bound_data,
+  varying = c("Feller", "Fill_M", "Fill_A"),
+  v.names = "value",
+  timevar = "bound",
+  times = c("Feller", "Fill_M", "Fill_A"),
+  direction = "long"
+)
+
+# Empirical data
+empirical_data <- data.frame(
+  n = 1:num_iterations,
+  value = error,
+  bound = "Empirical"
+)
+
+# Combine all data
+plot_data <- rbind(
+  bound_data_long[, c("n", "value", "bound")],
+  empirical_data
+)
+
+# Plot
+p_boundcomparison <- ggplot() +
+
+  # Theoretical bounds
+  geom_line(
+    data = bound_data_long,
+    aes(x = n, y = value, colour = bound),
+    linewidth = 0.9
+  ) +
+
+  # Empirical values
+  geom_point(
+    data = empirical_data,
+    aes(x = n, y = value, colour = bound),
+    size = 2
+  ) +
+
+  scale_y_log10(
+    limits = c(1e-10, 1e3)
+  ) +
+
+  scale_colour_manual(
+    values = c(
+      "Empirical" = "black",
+      "Feller" = "red",
+      "Fill_M" = "blue",
+      "Fill_A" = "darkgreen"
+    ),
+    labels = c(
+    "Empirical" = "Empirical",
+    "Feller" = "Feller bound",
+    "Fill_M" = "Fill M bound",
+    "Fill_A" = "Fill A bound"
+  )
+  ) +
+
+  labs(
+    title = "Convergence to the Stationary Distribution",
+    x = "Number of transitions",
+    y = "Infinity-norm error",
+    colour = NULL
+  ) +
+
+  theme_classic(base_size = 12) +
+
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+p_boundcomparison
+
+```
+
+# Section 6.1
+
+## Get pooled match prior helper function
+```{r get pooled match prior}
+get_pooled_match_prior <- function(chain_starts, home_team, away_team, exclude = NA) {
+  
+  pooled_data <- chain_starts %>%
+    filter(
+      (Home == home_team | Away == away_team)
+    )
+  
+  if (!is.na(exclude)) {
+  pooled_data <- pooled_data %>%
+    filter(Match_id != exclude)
+  }
+  
+  # Transition probabilities
+  transition_counts <- table(
+    pooled_data$pos_and_loc,
+    pooled_data$next_pos_and_loc
+  )
+  
+  P <- prop.table(transition_counts, margin = 1)
+  
+  # States with holding times
+  valid_states <- c(
+    "A_A50", "A_M", "A_H50",
+    "H_A50", "H_M", "H_H50"
+  )
+  
+  time_data <- pooled_data %>%
+    filter(
+      pos_and_loc %in% valid_states,
+      pos_and_loc_time > 0
+    )
+  
+  # Ordinary gamma states
+  gamma_states <- c(
+    "A_H50", "A_M",
+    "H_A50", "H_M"
+  )
+  gamma_params <- list()
+  
+  for (state in gamma_states) {
+    
+    x <- time_data %>%
+      filter(pos_and_loc == state) %>%
+      pull(pos_and_loc_time)
+    
+    fit <- fitdistr(x, "gamma")
+    
+    gamma_params[[state]] <- list(
+      type = "gamma",
+      shape = unname(fit$estimate["shape"]),
+      rate = unname(fit$estimate["rate"])
+    )
+  }
+  # Mixture gamma states
+  mixture_states <- c("A_A50", "H_H50")
+  
+  for (state in mixture_states) {
+    x <- time_data %>%
+      filter(pos_and_loc == state) %>%
+      pull(pos_and_loc_time)
+    
+    fit <- mixtools::gammamixEM(x,k = 2, maxit= 5000, verb = FALSE)
+    
+    gamma_params[[state]] <- list(
+      type = "gamma_mixture",
+      alpha = fit$gamma.pars["alpha", ],
+      beta = fit$gamma.pars["beta", ],
+      lambda = fit$lambda
+    )
+  }
+  
+  return(list(
+    P = P,
+    gamma = gamma_params
+  ))
+}
+```
+
+## Truncated simulator helper function
+```{r truncated gamma sim}
+#Truncated version of simulator for forecast
+truncated_gamma_discrete_sim <- function(P_list, gamma_params, init_state, time, quarter, home, away, scale = FALSE){
+  
+  #Initial values
+  current_state <- init_state
+  t <- time
+  quarter_time <- 20*60 #constant
+  home_start <- home
+  away_start <- away
+  first_state <- TRUE
+  
+  #faster gamma 
+  states <- names(gamma_params)
+  state_index <- setNames(seq_along(states), states)
+  
+  #Finish current quarter
+  while (t < quarter_time) {
+      params <- gamma_params[[current_state]]
+
+      # if rate is NA or 0, force dt = 0
+      if(is.null(params)){
+        dt <- 0
+      } else if (params$type == "gamma") {
+        dt <- rgamma(1,shape = params$shape, rate = params$rate)
+      } else if (params$type == "gamma_mixture") {
+        component <- sample(
+          1:length(params$lambda),
+          size = 1,
+          prob = params$lambda
+        )
+        dt <- rgamma(
+          1,
+          shape = params$alpha[component],
+          scale = params$beta[component]
+        )
+      } else {
+        # BIG ERROR
+        stop("Unknown distribution type: ", params$type)
+      }
+  
+      
+      if (!first_state){
+        #Update score
+        if (current_state == "HG"){
+          home <- home + 6
+        }
+        if (current_state == "HB"){
+          home <- home + 1
+        }
+        if (current_state == "AG"){
+          away <- away + 6
+        }
+        if (current_state == "AB"){
+          away <- away + 1
+        }
+      }
+        first_state <- FALSE
+        
+      t <- t + dt
+      if (t > quarter_time) break
+      
+      # sample next state
+      next_info <- P_list[[current_state]]
+      next_state <- sample(next_info$next_states, size = 1, prob = next_info$probs)
+      
+      
+      current_state <- next_state
+    }
+  
+  
+  #Finish remaining quarters
+  if (quarter < 4){
+    for (q in (quarter+1):4){
+      
+      current_state <- "N_M"
+      t <- 0
+      
+      while (t < quarter_time) {
+        params <- gamma_params[[current_state]]
+  
+      # if rate is NA, force dt = 0
+      if(is.null(params)){
+        dt <- 0
+      } else if (params$type == "gamma") {
+        dt <- rgamma(1,shape = params$shape, rate = params$rate)
+      } else if (params$type == "gamma_mixture") {
+        component <- sample(
+          1:length(params$lambda),
+          size = 1,
+          prob = params$lambda
+        )
+        dt <- rgamma(
+          1,
+          shape = params$alpha[component],
+          scale = params$beta[component]
+        )
+      } else {
+        # BIG ERROR
+        stop("Unknown distribution type: ", params$type)
+      }
+  
+        #Update score
+        if (current_state == "HG"){
+          home <- home + 6
+        }
+        if (current_state == "HB"){
+          home <- home + 1
+        }
+        if (current_state == "AG"){
+          away <- away + 6
+        }
+        if (current_state == "AB"){
+          away <- away + 1
+        }
+          
+        t <- t + dt
+        if (t > quarter_time) break
+        
+        # sample next state
+        next_info <- P_list[[current_state]]
+        next_state <- sample(next_info$next_states, size = 1, prob = next_info$probs)
+        
+        current_state <- next_state
+      }
+    
+    }
+  }
+  
+  if (scale == TRUE){
+    home <- home_start +
+        scale_factor * (home - home_start)
+    away <- away_start +
+        scale_factor * (away - away_start)
+  }
+  
+  forecast <- list(
+  home_forecast = home,
+  away_forecast = away
+)
+  return(forecast)
+}
+
+```
+
+
+## P conv helper function
+```{r Pconv}
+
+P_conv <- function(transition_probs) {
+  # Make sure rownames are the current states
+  states <- rownames(transition_probs)
+  
+  P_list <- lapply(states, function(st) {
+  probs <- transition_probs[st, ]
+  next_states <- names(probs)
+  prob_vals <- as.numeric(probs)
+  
+  # remove 0-probabilities
+  next_states <- next_states[prob_vals > 0]
+  prob_vals <- prob_vals[prob_vals > 0]
+  
+  list(next_states = next_states, probs = prob_vals)
+  })
+  names(P_list) <- states
+  return(P_list)
+}
+
+```
+
+## Individual game Bayesian Prediciton model
+```{r build bayesian prediciton model}
+#Forecaster
+
+bayesian_score_forecast <- function(pbp,prior,nreps = 10,incr = 1, alpha = 0){
+  
+  # Priors
+  prior_P <- prior$P
+  P <- prior_P
+  
+  prior_gamma <- prior$gamma
+  
+  #Lets assume that we have already filtered the pbp to be the chain starts
+  
+  #Create a vector of match times
+  cs_quarter_lengths <- tapply(pbp$match_time, pbp$Quarter, function(x) max(x, na.rm = TRUE))
+  time <- pbp$match_time
+  match_length <-  max(time, na.rm = TRUE)
+  
+  #Empty vectors for scores and predicted scores
+  n <- length(time)
+  home_scores <- rep(0,n)
+  away_scores <- rep(0,n)
+  home_forecast_scores <- rep(0,n)
+  away_forecast_scores <- rep(0,n)
+  home_win_rate <- rep(0,n)
+  
+  #Score counters
+  home <- 0
+  away <- 0
+  
+  #Loop through the entire pbp
+  for (i in 1:n){
+    if (i %% 50 == 0){cat("i =", i, "/", n, "\n")}
+    pbprow <- pbp[i,]
+    state <- pbprow$pos_and_loc
+    next_state <- pbprow$next_pos_and_loc
+    
+    #Update real score if necessary
+    if (state == "HG"){
+      home <- home + 6
+    }
+    if (state == "HB"){
+      home <- home + 1
+    }
+    if (state == "AG"){
+      away <- away + 6
+    }
+    if (state == "AB"){
+      away <- away + 1
+    }
+    
+    #record actual scores
+    home_scores[i] <- home
+    away_scores[i] <- away
+    
+    #Update gamma params
+    
+    #Update P matrix
+    P[state, ] <- (1 - alpha) * P[state, ]
+    P[state, next_state] <- P[state, next_state] + alpha
+    
+
+    #Find "adjusted time"
+    quarter <- pbp$Quarter[i]
+    time_adjusted <- ifelse(quarter>1, (time[i] - cs_quarter_lengths[quarter-1]) / (cs_quarter_lengths[quarter] - cs_quarter_lengths[quarter-1]) * 1200, time[i] / cs_quarter_lengths[1] * 1200) 
+    #Run simulations to forecast score
+    forecast_sum <- c(0,0)
+    home_wins <- 0
+    
+    if ((i %% incr == 0) | (i == 1) | (state %in% c("HG", "HB", "AG", "AB"))){
+    for (k in 1:nreps){
+        forecast <- truncated_gamma_discrete_sim(P_conv(P), prior_gamma, state, time_adjusted, quarter, home, away)
+        forecast_sum <- forecast_sum + c(forecast$home_forecast, forecast$away_forecast)
+        if (forecast$home_forecast > forecast$away_forecast){
+          home_wins <- home_wins + 1
+        }
+      }
+  
+      home_forecast_scores[i] <- forecast_sum[1]/nreps
+      away_forecast_scores[i] <- forecast_sum[2]/nreps
+      home_win_rate[i] <- home_wins / nreps
+    } else {
+      home_forecast_scores[i] <- home_forecast_scores[i-1]
+      away_forecast_scores[i] <- away_forecast_scores[i-1]
+      home_win_rate[i] <- home_win_rate[i-1]
+    }
+    
+    
+  }
+  
+  # Create df for return
+  score_forecast <- data.frame(
+  Time = time,
+  Home = home_scores,  
+  Away = away_scores,
+  Home_Forecast = home_forecast_scores,
+  Away_Forecast = away_forecast_scores,
+  Home_Win_Rate = home_win_rate
+  ) 
+  
+  return(score_forecast)
+}
+
+bayesian_test_r1richvscarl <- chain_starts2[chain_starts2$Match_id == "CD_M20210140101",]
+bayesian_test_r20gcvmelb <- chain_starts2[chain_starts2$Match_id == "CD_M20210142002",]
+
+#Remove last row as it is problematic
+bayesian_test_r20gcvmelb <- bayesian_test_r20gcvmelb %>%
+  filter(!is.na(next_pos_and_loc))
+#Remove last row as it is problematic
+bayesian_test_r1richvscarl <- bayesian_test_r1richvscarl %>%
+  filter(!is.na(next_pos_and_loc))
+
+priors <- get_pooled_match_prior(chain_starts2, "Richmond", "Carlton", NA)
+#priors <- get_pooled_match_prior(chain_start2, "Gold Coast Suns", "Melbourne")
+
+increment <- 5
+
+score_forecast <- bayesian_score_forecast(bayesian_test_r1richvscarl,priors,1000,increment,0)
+#score_forecast <- bayesian_score_forecast(bayesian_test_r20gcvmelb,priors,250,5,0.01)
+
+score_forecast <- score_forecast %>%
+  mutate(
+    Score_Diff = Home - Away
+  )
+
+score_forecast_long <- score_forecast %>%
+  pivot_longer(
+    cols = -Time,
+    names_to = "Series",
+    values_to = "Score"
+  )
+
+# Richmond vs carlton forecast plot
+p <- ggplot(
+  score_forecast_long %>%
+    filter(Series %in% c(
+      "Home", "Away",
+      "Home_Forecast", "Away_Forecast"
+    )),
+  aes(x = Time, y = Score, colour = Series, linetype = Series)
+) +
+  geom_step(
+    data = ~ subset(.x, Series %in% c("Home", "Away")),
+    linewidth = 0.9
+  ) +
+  geom_step(
+    data = ~ subset(.x, Series %in% c("Home_Forecast", "Away_Forecast")),
+    linewidth = 0.9,
+    alpha = 0.45
+  ) +
+  scale_colour_manual(
+    values = c(
+      "Home" = "#C44E52",
+      "Away" = "#4C72B0",
+      "Home_Forecast" = "#C44E52",
+      "Away_Forecast" = "#4C72B0"
+    ),
+    labels = c(
+      "Home" = "Home",
+      "Away" = "Away",
+      "Home_Forecast" = "Home forecast",
+      "Away_Forecast" = "Away forecast"
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "Home" = "solid",
+      "Away" = "solid",
+      "Home_Forecast" = "solid",
+      "Away_Forecast" = "solid"
+    ),
+    labels = c(
+      "Home" = "Home",
+      "Away" = "Away",
+      "Home_Forecast" = "Home forecast",
+      "Away_Forecast" = "Away forecast"
+    )
+  ) +
+  labs(
+    title = "Cumulative Scores and Forecasted Final Scores",
+    x = "Match time (s)",
+    y = "Score",
+    colour = NULL,
+    linetype = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+p
+
+# Win % plot
+p <- ggplot(
+  score_forecast_long %>%
+    filter(Series %in% c("Score_Diff", "Home_Win_Rate")),
+  aes(x = Time)
+) +
+  geom_hline(
+  yintercept = 0,
+  linetype = "dashed",
+  linewidth = 0.5,
+  colour = "grey50"
+) +
+  # Score difference
+  geom_line(
+    data = ~ subset(.x, Series == "Score_Diff"),
+    aes(y = Score, colour = "Score difference"),
+    linewidth = 1
+  ) +
+  
+  # Home win probability
+  geom_line(
+    data = ~ subset(.x, Series == "Home_Win_Rate"),
+    aes(y = (Score - 0.5) * 100, colour = "Home win probability"),
+    linewidth = 1,
+    alpha = 0.6
+  ) +
+  
+  # Primary axis: score difference
+  scale_y_continuous(
+    name = "Score difference",
+    sec.axis = sec_axis(
+      ~ . / 100 + 0.5,
+      name = "Home win probability",
+      labels = scales::percent
+    )
+  ) +
+  
+  scale_colour_manual(
+    values = c(
+      "Score difference" = "black",
+      "Home win probability" = "#4C72B0"
+    )
+  ) +
+  
+  labs(  title = "Score Difference and Home Win Probability",
+    x = "Match time (s)",
+    colour = NULL
+  ) + theme(
+  plot.title = element_text(
+    hjust = 0.5,
+    face = "bold"
+  ),
+  legend.position = "bottom",
+  panel.grid.minor = element_blank(),
+  panel.grid.major.x = element_blank()
+) +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.title.y.left = element_text(),
+    axis.title.y.right = element_text(),
+    legend.margin = margin(t = -5)
+  ) +
+  scale_y_continuous(
+  name = "Score difference",
+  limits = c(-50, 50),
+  sec.axis = sec_axis(
+    ~ . / 100 + 0.5,
+    name = "Home win probability",
+    labels = scales::percent
+  )
+)
+
+p
+
+```
+
+## Selective version of bayesian prediction model
+If we are going to simulate all games, need a version that only simulates every now and then
+```{r selective version of bayesian prediction model}
+bayesian_score_forecast_selective <- function(pbp,prior,nreps = 10, alpha = 0.01, scale = FALSE){
+  
+  # Priors
+  prior_P <- prior$P
+  P <- prior_P
+  
+  prior_gamma <- prior$gamma
+
+  #Lets assume that we have already filtered the pbp to be the chain starts
+  
+  #Create a vector of match times
+  cs_quarter_lengths <- tapply(pbp$match_time, pbp$Quarter, function(x) max(x, na.rm = TRUE))
+  time <- pbp$match_time
+  match_length <-  max(time, na.rm = TRUE)
+  
+  #Empty vectors for scores and predicted scores
+  n <- length(time)
+quarter_forecasts <- data.frame(
+  Quarter = integer(),
+  Home_Score = integer(),
+  Away_Score = integer(),
+  Home_Forecast = numeric(),
+  Away_Forecast = numeric(),
+  Home_Win_Rate = numeric()
+)
+  
+  #Score counters
+  home <- 0
+  away <- 0
+  
+  #Quater ends
+  quarter_end <- c(
+  which(pbp$Quarter[-nrow(pbp)] != pbp$Quarter[-1]),
+  nrow(pbp)
+)
+  
+  #Loop through the entire pbp
+  for (i in 1:n){
+    pbprow <- pbp[i,]
+    state <- pbprow$pos_and_loc
+    next_state <- pbprow$next_pos_and_loc
+    
+    #Update real score if necessary
+    if (state == "HG"){
+      home <- home + 6
+    }
+    if (state == "HB"){
+      home <- home + 1
+    }
+    if (state == "AG"){
+      away <- away + 6
+    }
+    if (state == "AB"){
+      away <- away + 1
+    }
+    
+    #Update P matrix
+    P[state, ] <- (1 - alpha) * P[state, ]
+    P[state, next_state] <- P[state, next_state] + alpha
+    
+
+    #Find "adjusted time"
+    quarter <- pbp$Quarter[i]
+    time_adjusted <- ifelse(quarter>1, (time[i] - cs_quarter_lengths[quarter-1]) / (cs_quarter_lengths[quarter] - cs_quarter_lengths[quarter-1]) * 1200, time[i] / cs_quarter_lengths[1] * 1200) 
+    #Run simulations to forecast score
+    forecast_sum <- c(0,0)
+    home_wins <- 0
+    
+if (i %in% quarter_end){
+
+    forecast_sum <- c(0,0)
+    home_wins <- 0
+
+    for (k in 1:nreps){
+
+        forecast <- truncated_gamma_discrete_sim(
+          P_conv(P),
+          prior_gamma,
+          state,
+          time_adjusted,
+          quarter,
+          home,
+          away,
+          scale
+        )
+
+        forecast_sum <- forecast_sum +
+          c(forecast$home_forecast,
+            forecast$away_forecast)
+
+        if (forecast$home_forecast > forecast$away_forecast){
+          home_wins <- home_wins + 1
+        }
+    }
+
+    quarter_forecasts <- rbind(
+      quarter_forecasts,
+      data.frame(
+        Quarter = quarter,
+        Home_Score = home,
+        Away_Score = away,
+        Home_Forecast = forecast_sum[1]/nreps,
+        Away_Forecast = forecast_sum[2]/nreps,
+        Home_Win_Rate = home_wins/nreps
+      )
+    )
+}
+    
+  }
+  
+  return(quarter_forecasts)
+}
+
+```
+
+
+## Simulate error for the null and EWMA models
+We want to compare the predicted final score at QT,HT,3QT with the actual score and find the error. This can be done for the whole season.
+```{r}
+
+# Firstly lets see 
+season_simulator <- function(chain_starts,nreps,alpha,scale=FALSE){
+  all_results <- list()         
+  
+  counter <- 0
+  for (match in unique(chain_starts$Match_id)) {
+    if(counter %% 10 == 1){cat("i =", counter, "/", 22*9, "\n")}
+    # Split target match
+    test_match <- chain_starts %>%
+      filter(Match_id == match)
+    
+    test_match <- test_match %>%
+  filter(!is.na(next_pos_and_loc))
+    
+    # Extract teams and score
+    home_team <- unique(test_match$Home)
+    away_team <- unique(test_match$Away)
+    
+    # Build prior excluding this match
+    priors <- get_pooled_match_prior(chain_starts, home_team, 
+                                     away_team, exclude = match)
+    
+    # Run Bayesian forecast
+    forecast <- bayesian_score_forecast_selective(
+      test_match,
+      priors,
+      nreps,
+      alpha,
+      scale
+    )
+    
+    final_home <- forecast$Home_Score[forecast$Quarter == 4]
+    final_away <- forecast$Away_Score[forecast$Quarter == 4]
+    
+    # Compute error
+    forecast <- forecast %>%
+  mutate(
+    Match_id = match,
+    Home_Team = unique(test_match$Home),
+    Away_Team = unique(test_match$Away),
+    Final_Home = final_home,
+    Final_Away = final_away,
+    Home_Error = abs(Home_Forecast - final_home),
+    Away_Error = abs(Away_Forecast - final_away),
+    Score_MAE = (Home_Error + Away_Error)/2
+  )
+    
+    # Store
+    all_results[[match]] <- forecast
+    
+    
+    counter <- counter + 1;
+  }
+  
+  results <- bind_rows(all_results)
+  return(results)
+}
+
+# Each of these takes about half an hour
+season_forecasts2_null <- suppressWarnings(season_simulator(chain_starts2,1000,0,FALSE))
+season_forecasts2_ewma_alpha0001 <- suppressWarnings(season_simulator(chain_starts2,1000,0.001,FALSE))
+season_forecasts2_ewma_alpha0002 <- suppressWarnings(season_simulator(chain_starts2,1000,0.002,FALSE))
+season_forecasts2_ewma_alpha0005 <- suppressWarnings(season_simulator(chain_starts2,1000,0.005,FALSE))
+season_forecasts2_ewma_alpha001 <- suppressWarnings(season_simulator(chain_starts2,1000,0.01,FALSE))
+season_forecasts2_ewma_alpha002 <- suppressWarnings(season_simulator(chain_starts2,1000,0.02,FALSE))
+season_forecasts2_ewma_alpha005 <- suppressWarnings(season_simulator(chain_starts2,1000,0.05,FALSE))
+season_forecasts2_ewma_alpha01 <- suppressWarnings(season_simulator(chain_starts2,1000,0.1,FALSE))
+
+ season_forecasts2_ewma_alpha0003 <- suppressWarnings(season_simulator(chain_starts2,1000,0.003,FALSE))
+ season_forecasts2_ewma_alpha0007 <- suppressWarnings(season_simulator(chain_starts2,1000,0.007,FALSE))
+ season_forecasts2_ewma_alpha0004 <- suppressWarnings(season_simulator(chain_starts2,1000,0.004,FALSE))
+ season_forecasts2_ewma_alpha0006 <- suppressWarnings(season_simulator(chain_starts2,1000,0.006,FALSE))
+ season_forecasts2_ewma_alpha0008 <- suppressWarnings(season_simulator(chain_starts2,1000,0.008,FALSE))
+
+
+```
+
+
+
+## Create a extrapolation model for comparison
+Take the score at QT*2, HT*2 and 3QT* 4/3
+```{r extrapolation model}
+
+forecast_extrapolate <- function(pbp){
+  
+  #Create a vector of match times
+  cs_quarter_lengths <- tapply(pbp$match_time, pbp$Quarter, function(x) max(x, na.rm = TRUE))
+  time <- pbp$match_time
+  match_length <-  max(time, na.rm = TRUE)
+  
+  #Empty vectors for scores and predicted scores
+  n <- length(time)
+  quarter_forecasts <- data.frame(
+    Quarter = integer(),
+    Home_Score = integer(),
+    Away_Score = integer(),
+    Home_Forecast = numeric(),
+    Away_Forecast = numeric(),
+    Home_Win_Rate = numeric()
+  )
+  
+  #Score counters
+  home <- 0
+  away <- 0
+  
+  #Quater ends
+  quarter_end <- c(which(pbp$Quarter[-nrow(pbp)] != pbp$Quarter[-1]), nrow(pbp))
+  
+  #Loop through the entire pbp
+  for (i in 1:n){
+    pbprow <- pbp[i,]
+    state <- pbprow$pos_and_loc
+    next_state <- pbprow$next_pos_and_loc
+    
+    #Update real score if necessary
+    if (state == "HG"){
+      home <- home + 6
+    }
+    if (state == "HB"){
+      home <- home + 1
+    }
+    if (state == "AG"){
+      away <- away + 6
+    }
+    if (state == "AB"){
+      away <- away + 1
+    }
+
+    if (i %in% quarter_end){
+    
+    quarter <- pbp$Quarter[i]  
+      
+    if (quarter == 1){
+      home_forecast <- home * 4
+      away_forecast <- away * 4
+    } else if(quarter == 2){
+      home_forecast <- home * 2
+      away_forecast <- away * 2 
+    } else if(quarter == 3){
+      home_forecast <- home * 4/3
+      away_forecast <- away * 4/3
+    } else{
+      home_forecast <- home
+      away_forecast <- away
+    }
+      
+    #Update gamma params
+    quarter_forecasts <- rbind(
+      quarter_forecasts,
+      data.frame(
+        Quarter = quarter,
+        Home_Score = home,
+        Away_Score = away,
+        Home_Forecast = home_forecast,
+        Away_Forecast = away_forecast
+      )
+    )
+  
+    }
+  }
+  return(quarter_forecasts)
+}
+
+#----------------------------------------------------------------------------
+
+season_simulator_extrapolate <- function(chain_starts){
+  all_results <- list() 
+  counter <- 1
+  for (match in unique(chain_starts$Match_id)) {
+      if(counter %% 10 == 1){cat("i =", counter, "/", 22*9, "\n")}
+      # Split target match
+      test_match <- chain_starts %>%
+        filter(Match_id == match)
+      
+    #   test_match <- test_match %>%
+    # filter(!is.na(next_pos_and_loc))
+      
+      # Extract teams and score
+      home_team <- unique(test_match$Home)
+      away_team <- unique(test_match$Away)
+      
+      # Extrapolate
+      forecast <- forecast_extrapolate(test_match)
+      
+      final_home <- forecast$Home_Score[forecast$Quarter == 4]
+      final_away <- forecast$Away_Score[forecast$Quarter == 4]
+      
+      # Compute error
+      forecast <- forecast %>%
+    mutate(
+      Match_id = match,
+      Home_Team = unique(test_match$Home),
+      Away_Team = unique(test_match$Away),
+      Final_Home = final_home,
+      Final_Away = final_away,
+      Home_Error = (Home_Forecast - final_home),
+      Away_Error = (Away_Forecast - final_away)
+    )
+      
+      # Store
+      all_results[[match]] <- forecast
+      
+      
+      counter <- counter + 1;
+    }
+    
+    results <- bind_rows(all_results)
+    return(results)
+  }
+
+#_____________________________________________________________________________
+season_forecasts_extrapolations <- season_simulator_extrapolate(chain_starts2)
+
+forecast_extrapolations_errors <- season_forecasts_extrapolations %>%
+  filter(Quarter < 4)%>%
+  mutate(
+    Home_Abs_Error = abs(Home_Forecast - Final_Home),
+    Away_Abs_Error = abs(Away_Forecast - Final_Away),
+    Total_Abs_Error = abs(Home_Forecast - Final_Home) + abs(Away_Forecast - Final_Away)
+  )
+
+```
+
+
+# Section 6.2
+
+## Get match prior counts helper function
+```{r Get pooled match prior counts}
+get_pooled_match_prior_counts <- function(chain_starts, home_team, away_team, exclude = NA) {
+  
+  pooled_data <- chain_starts %>%
+    filter(
+      (Home == home_team | Away == away_team)
+    )
+  
+  if (!is.na(exclude)) {
+  pooled_data <- pooled_data %>%
+    filter(Match_id != exclude)
+  }
+  
+  # Transition probabilities
+  transition_counts <- table(
+    pooled_data$pos_and_loc,
+    pooled_data$next_pos_and_loc
+  )
+  
+  P_counts <- transition_counts
+  
+  # States with holding times
+  valid_states <- c(
+    "A_A50", "A_M", "A_H50",
+    "H_A50", "H_M", "H_H50"
+  )
+  
+  time_data <- pooled_data %>%
+    filter(
+      pos_and_loc %in% valid_states,
+      pos_and_loc_time > 0
+    )
+  
+  # ---------------------------------------------------
+  # Ordinary gamma states
+  
+  gamma_states <- c(
+    "A_H50", "A_M",
+    "H_A50", "H_M"
+  )
+  
+  gamma_params <- list()
+  
+  for (state in gamma_states) {
+    
+    x <- time_data %>%
+      filter(pos_and_loc == state) %>%
+      pull(pos_and_loc_time)
+    
+    fit <- fitdistr(x, "gamma")
+    
+    gamma_params[[state]] <- list(
+      type = "gamma",
+      shape = unname(fit$estimate["shape"]),
+      rate = unname(fit$estimate["rate"])
+    )
+  }
+  
+  
+  # ----------------------------------------------------------------
+  # Mixture gamma states
+  
+  mixture_states <- c("A_A50", "H_H50")
+  
+  for (state in mixture_states) {
+    
+    x <- time_data %>%
+      filter(pos_and_loc == state) %>%
+      pull(pos_and_loc_time)
+    
+    fit <- mixtools::gammamixEM(x,k = 2, maxit= 5000, verb = FALSE)
+    
+    gamma_params[[state]] <- list(
+      type = "gamma_mixture",
+      alpha = fit$gamma.pars["alpha", ],
+      beta = fit$gamma.pars["beta", ],
+      lambda = fit$lambda
+    )
+  }
+  
+  return(list(
+    P_counts = P_counts,
+    gamma = gamma_params
+  ))
+}
+
+```
+
+
+## Selective Dirichlet model (bayesian_score_forecast_selective_dirchlet)
+```{r Dirichlet prediction model}
+# So the first thing that we have to do is now store the P_counts as inputs 
+# rather than the P_probs so that we can update them
+bayesian_score_forecast_selective_dirchlet <- function(pbp,prior_counts,
+                                                       nreps = 10, factor = 1, 
+                                                       scale = FALSE){
+  
+  # Priors
+  P_counts <- prior_counts$P_counts
+  
+  prior_gamma <- prior_counts$gamma
+  
+  #Lets assume that we have already filtered the pbp to be the chain starts
+  
+  #Create a vector of match times
+  cs_quarter_lengths <- tapply(pbp$match_time, pbp$Quarter, function(x) max(x, na.rm = TRUE))
+  time <- pbp$match_time
+  match_length <-  max(time, na.rm = TRUE)
+  
+  #Empty vectors for scores and predicted scores
+  n <- length(time)
+quarter_forecasts <- data.frame(
+  Quarter = integer(),
+  Home_Score = integer(),
+  Away_Score = integer(),
+  Home_Forecast = numeric(),
+  Away_Forecast = numeric(),
+  Home_Win_Rate = numeric()
+)
+  
+  #Score counters
+  home <- 0
+  away <- 0
+  
+  #Quater ends
+  quarter_end <- c(
+  which(pbp$Quarter[-nrow(pbp)] != pbp$Quarter[-1]),
+  nrow(pbp)
+)
+  
+  #Loop through the entire pbp
+  for (i in 1:n){
+    pbprow <- pbp[i,]
+    state <- pbprow$pos_and_loc
+    next_state <- pbprow$next_pos_and_loc
+    
+    #Update real score if necessary
+    if (state == "HG"){
+      home <- home + 6
+    }
+    if (state == "HB"){
+      home <- home + 1
+    }
+    if (state == "AG"){
+      away <- away + 6
+    }
+    if (state == "AB"){
+      away <- away + 1
+    }
+
+    #Update gamma params
+    
+    #Update P_counts matrix
+    P_counts[state, next_state] <- P_counts[state, next_state] + 1*factor
+    P <- prop.table(P_counts, margin = 1)
+
+    #Find "adjusted time"
+    quarter <- pbp$Quarter[i]
+    time_adjusted <- ifelse(quarter>1, (time[i] - cs_quarter_lengths[quarter-1]) / (cs_quarter_lengths[quarter] - cs_quarter_lengths[quarter-1]) * 1200, time[i] / cs_quarter_lengths[1] * 1200) 
+    #Run simulations to forecast score
+    forecast_sum <- c(0,0)
+    home_wins <- 0
+    
+if (i %in% quarter_end){
+
+    forecast_sum <- c(0,0)
+    home_wins <- 0
+
+    for (k in 1:nreps){
+        forecast <- truncated_gamma_discrete_sim(
+          P_conv(P),
+          prior_gamma,
+          state,
+          time_adjusted,
+          quarter,
+          home,
+          away,
+          scale
+        )
+        forecast_sum <- forecast_sum +
+          c(forecast$home_forecast,
+            forecast$away_forecast)
+
+        if (forecast$home_forecast > forecast$away_forecast){
+          home_wins <- home_wins + 1
+        }
+    }
+    quarter_forecasts <- rbind(
+      quarter_forecasts,
+      data.frame(
+        Quarter = quarter,
+        Home_Score = home,
+        Away_Score = away,
+        Home_Forecast = forecast_sum[1]/nreps,
+        Away_Forecast = forecast_sum[2]/nreps,
+        Home_Win_Rate = home_wins/nreps
+      )
+    )
+}
+    
+  }
+  
+  return(quarter_forecasts)
+}
+
+
+```
+
+##Test Dirichlet model
+```{r test dirichlet model}
+season_simulator_dirichlet <- function(chain_starts,nreps,factor = 1,scale=FALSE){
+  all_results <- list()         
+  
+  counter <- 0
+  for (match in unique(chain_starts$Match_id)) {
+    if(counter %% 10 == 1){cat("i =", counter, "/", 22*9, "\n")}
+    # Split target match
+    test_match <- chain_starts %>%
+      filter(Match_id == match)
+    
+    test_match <- test_match %>%
+  filter(!is.na(next_pos_and_loc))
+    
+    # Extract teams and score
+    home_team <- unique(test_match$Home)
+    away_team <- unique(test_match$Away)
+    
+    # Build prior excluding this match
+    priors <- get_pooled_match_prior_counts(chain_starts, home_team, 
+                                     away_team, exclude = match)
+    
+    # Run Bayesian forecast
+    forecast <- bayesian_score_forecast_selective_dirchlet(
+      test_match,
+      priors,
+      nreps,
+      factor,
+      scale
+    )
+    
+    final_home <- forecast$Home_Score[forecast$Quarter == 4]
+    final_away <- forecast$Away_Score[forecast$Quarter == 4]
+    
+    # Compute error
+    forecast <- forecast %>%
+  mutate(
+    Match_id = match,
+    Home_Team = unique(test_match$Home),
+    Away_Team = unique(test_match$Away),
+    Final_Home = final_home,
+    Final_Away = final_away,
+    Home_Error = abs(Home_Forecast - final_home),
+    Away_Error = abs(Away_Forecast - final_away),
+    Score_MAE = (Home_Error + Away_Error)/2
+  )
+    
+    # Store
+    all_results[[match]] <- forecast
+    
+    
+    counter <- counter + 1;
+  }
+  
+  results <- bind_rows(all_results)
+  return(results)
+}
+
+# This takes about half an hour
+season_forecasts2_dirichlet <- suppressWarnings(season_simulator_dirichlet(chain_starts2,1000,factor = 1, FALSE))
+season_forecasts2_dirichlet2 <- suppressWarnings(season_simulator_dirichlet(chain_starts2,1000,factor = 2, FALSE))
+season_forecasts2_dirichlet3 <- suppressWarnings(season_simulator_dirichlet(chain_starts2,1000,factor = 3, FALSE))
+season_forecasts2_dirichlet4 <- suppressWarnings(season_simulator_dirichlet(chain_starts2,1000,factor = 4, FALSE))
+season_forecasts2_dirichlet5 <- suppressWarnings(season_simulator_dirichlet(chain_starts2,1000,factor = 5, FALSE))
+season_forecasts2_dirichlet10 <- suppressWarnings(season_simulator_dirichlet(chain_starts2,1000,factor = 10, FALSE))
+season_forecasts2_dirichlet20 <- suppressWarnings(season_simulator_dirichlet(chain_starts2,1000,factor = 20, FALSE))
+season_forecasts2_dirichlet50 <- suppressWarnings(season_simulator_dirichlet(chain_starts2,1000,factor = 50, FALSE))
+
+ season_forecasts2_dirichlet7 <- suppressWarnings(season_simulator_dirichlet(chain_starts2,1000,factor = 7, FALSE))
+ season_forecasts2_dirichlet6 <- suppressWarnings(season_simulator_dirichlet(chain_starts2,1000,factor = 6, FALSE))
+ season_forecasts2_dirichlet8 <- suppressWarnings(season_simulator_dirichlet(chain_starts2,1000,factor = 8, FALSE))
+ season_forecasts2_dirichlet9 <- suppressWarnings(season_simulator_dirichlet(chain_starts2,1000,factor = 9, FALSE))
+```
+
+
+# Section 6.3
+## EMWA errors are in 6.1 section
+
+# Section 6.4
+## Average scores by quarter
+```{r average score by quarter}
+quarter_scores_long <- season_forecasts_extrapolations %>%
+  select(Match_id, Quarter, Home_Score, Away_Score) %>%
+  pivot_longer(
+    cols = c(Home_Score, Away_Score),
+    names_to = "Team",
+    values_to = "Score"
+  ) %>%
+  mutate(
+    Team = recode(
+      Team,
+      Home_Score = "Home",
+      Away_Score = "Away"
+    )
+  )
+
+quarter_scoring_summary <- quarter_scores_long %>%
+  arrange(Match_id, Team, Quarter) %>%
+  group_by(Match_id, Team) %>%
+  mutate(
+    Quarter_Score = Score - lag(Score, default = 0)
+  ) %>%
+  ungroup() %>%
+  group_by(Quarter, Team) %>%
+  summarise(
+    Mean_Quarter_Score = mean(Quarter_Score, na.rm = TRUE),
+    SD_Quarter_Score = sd(Quarter_Score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+quarter_scoring_summary
+
+# Plot average points scored during each quarter
+p <- ggplot(
+  quarter_scoring_summary,
+  aes(
+    x = Quarter,
+    y = Mean_Quarter_Score,
+    colour = Team,
+    group = Team
+  )
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  labs(
+    title = "Average Points Scored During Each Quarter",
+    x = "Quarter",
+    y = "Average Points Scored",
+    colour = NULL
+  ) +
+  scale_x_continuous(
+    breaks = 1:4
+  ) +
+  scale_colour_manual(
+    values = c(
+      "Home" = "red",
+      "Away" = "blue"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom"
+  )
+p
+
+cumulative_scoring_summary <- quarter_scoring_summary %>%
+  arrange(Team, Quarter) %>%
+  group_by(Team) %>%
+  mutate(
+    Mean_Cumulative_Score = cumsum(Mean_Quarter_Score)
+  ) %>%
+  ungroup() %>%
+  bind_rows(
+    tibble(
+      Team = c("Home", "Away"),
+      Quarter = 0,
+      Mean_Cumulative_Score = 0
+    )
+  ) %>%
+  arrange(Team, Quarter)
+
+p <- ggplot(
+  cumulative_scoring_summary,
+  aes(
+    x = Quarter,
+    y = Mean_Cumulative_Score,
+    colour = Team,
+    group = Team
+  )
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  labs(
+    title = "Average Cumulative Score After Each Quarter",
+    x = "Quarter",
+    y = "Average Cumulative Score",
+    colour = NULL
+  ) +
+  scale_x_continuous(
+    breaks = 0:4,
+    labels = c("Start", "Q1", "Q2", "Q3", "Q4")
+  ) +
+  scale_colour_manual(
+    values = c(
+      "Home" = "red",
+      "Away" = "blue"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom"
+  )
+
+p
+
+```
+
+## Variation between and within quarters
+```{r varation within between quarters}
+# Divide each quarter into 10 equal bins
+
+quarter_lengths <- pbp %>%
+  group_by(Match_id, Quarter) %>%
+  summarise(
+    quarter_length = max(TimeSec, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+bin_width <- 10
+
+score_events <- pbp %>%
+  filter(Stat %in% c("Goal", "Behind")) %>%
+  left_join(
+    quarter_lengths,
+    by = c("Match_id", "Quarter")
+  ) %>%
+  mutate(
+    quarter_pct = 100 * TimeSec / quarter_length,
+
+    Team = case_when(
+      Team_status == "home" ~ "Home",
+      Team_status == "away" ~ "Away"
+    ),
+
+    Score = case_when(
+      Stat == "Goal" ~ 6,
+      Stat == "Behind" ~ 1
+    ),
+
+    bin = cut(
+      quarter_pct,
+      breaks = seq(0, 100, bin_width),
+      include.lowest = TRUE,
+      labels = FALSE
+    )
+  )
+
+# ------------------------------------------------------------
+# Score within each tenth of each quarter
+
+bin_scores <- score_events %>%
+  group_by(Match_id, Quarter, Team, bin) %>%
+  summarise(
+    score = sum(Score),
+    .groups = "drop"
+  ) %>%
+  group_by(Match_id, Quarter, Team) %>%
+  complete(
+    bin = 1:10,
+    fill = list(score = 0)
+  ) %>%
+  ungroup()
+
+# ------------------------------------------------------------
+# Mean score within each tenth of each quarter
+
+mean_bin_scores <- bin_scores %>%
+  group_by(Quarter, Team, bin) %>%
+  summarise(
+    mean_score = mean(score),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    bin_midpoint = (bin - 0.5) * bin_width
+  )
+
+mean_bin_scores
+
+quarter_scores <- score_events %>%
+  group_by(Match_id, Quarter, Team) %>%
+  summarise(
+    score = sum(Score),
+    .groups = "drop"
+  ) %>%
+  complete(
+    Match_id,
+    Quarter = 1:4,
+    Team,
+    fill = list(score = 0)
+  ) %>%
+  pivot_wider(
+    names_from = Quarter,
+    values_from = score,
+    names_prefix = "Q"
+  )
+
+home_scores <- quarter_scores %>%
+  filter(Team == "Home")
+
+away_scores <- quarter_scores %>%
+  filter(Team == "Away")
+
+friedman.test(
+  as.matrix(home_scores[, c("Q1", "Q2", "Q3", "Q4")])
+)
+
+friedman.test(
+  as.matrix(away_scores[, c("Q1", "Q2", "Q3", "Q4")])
+)
+
+
+library(broom)
+
+trend_tests <- mean_bin_scores %>%
+  group_by(Team, Quarter) %>%
+  do(
+    tidy(lm(mean_score ~ bin, data = .))
+  ) %>%
+  ungroup() %>%
+  filter(term == "bin") %>%
+  select(Team, Quarter, estimate, std.error, statistic, p.value) %>%
+  mutate(
+    Quarter = paste0("Q", Quarter)
+  )
+
+trend_tests
+
+p <- ggplot(
+  mean_bin_scores,
+  aes(
+    x = bin,
+    y = mean_score,
+    colour = Team
+  )
+) +
+  geom_point(size = 2) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE
+  ) +
+  facet_grid(
+    Team ~ Quarter,
+    labeller = labeller(
+      Quarter = function(x) paste0("Q", x)
+    )
+  ) +
+  scale_x_continuous(
+    breaks = 1:10
+  ) +
+  scale_colour_manual(
+    values = c(
+      "Home" = "red",
+      "Away" = "blue"
+    )
+  ) +
+  labs(
+    title = "Within-quarter trends in mean scoring",
+    x = "10% segment of quarter",
+    y = "Mean score",
+    colour = NULL
+  ) +
+  theme_minimal()
+
+away_long <- away_scores %>%
+  select(Match_id, Q1, Q2, Q3, Q4) %>%
+  pivot_longer(
+    cols = starts_with("Q"),
+    names_to = "Quarter",
+    values_to = "Score"
+  )
+
+wilcox.test(away_scores$Q1, away_scores$Q2, paired = TRUE)
+wilcox.test(away_scores$Q2, away_scores$Q3, paired = TRUE)
+wilcox.test(away_scores$Q3, away_scores$Q4, paired = TRUE)
+
+wilcox.test(home_scores$Q1, home_scores$Q2, paired = TRUE)
+wilcox.test(home_scores$Q2, home_scores$Q3, paired = TRUE)
+wilcox.test(home_scores$Q3, home_scores$Q4, paired = TRUE)
+
+away_quarter_long <- away_scores %>%
+  pivot_longer(
+    cols = Q1:Q4,
+    names_to = "Quarter",
+    values_to = "Score"
+  )
+
+ggplot(
+  away_quarter_long,
+  aes(x = Score)
+) +
+  geom_histogram(
+    binwidth = 5,
+    boundary = 0,
+    colour = "black"
+  ) +
+  geom_vline(
+    data = away_quarter_long %>%
+      group_by(Quarter) %>%
+      summarise(
+        Mean = mean(Score),
+        .groups = "drop"
+      ),
+    aes(xintercept = Mean),
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  facet_wrap(~ Quarter, ncol = 2) +
+  labs(
+    title = "Distribution of Away-Team Scores by Quarter",
+    x = "Score",
+    y = "Number of Matches"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+    panel.grid.minor = element_blank()
+  )
+
+away_quarter_long %>%
+  group_by(Quarter) %>%
+  summarise(
+    Mean = mean(Score),
+    Median = median(Score),
+    Proportion_30_plus = mean(Score >= 30),
+    Count_30_plus = sum(Score >= 30),
+    Proportion_40_plus = mean(Score >= 40),
+    Count_40_plus = sum(Score >= 40),
+    Proportion_50_plus = mean(Score >= 50),
+    Count_50_plus = sum(Score >= 50),
+    n = n()
+  )
+
+```
+
+
+## Transition matrix by quarter
+```{r transiton matrix by quarter}
+# Transition matrix fitted by quarter
+# Function to estimate transition matrix for a given quarter
+get_transition_matrix <- function(data, quarter) {
+  
+  counts <- data %>%
+    filter(
+      Quarter == quarter,
+      !is.na(next_pos_and_loc)
+    ) %>%
+    count(pos_and_loc, next_pos_and_loc) %>%
+    tidyr::pivot_wider(
+      names_from = next_pos_and_loc,
+      values_from = n,
+      values_fill = 0
+    ) %>%
+    as.data.frame()
+  
+  # Convert to matrix
+  states <- new_order
+  
+  transition_counts <- matrix(
+    0,
+    nrow = length(states),
+    ncol = length(states),
+    dimnames = list(states, states)
+  )
+  
+  for (i in seq_len(nrow(counts))) {
+    from <- counts$pos_and_loc[i]
+    
+    for (j in seq_along(states)) {
+      to <- states[j]
+      
+      if (to %in% names(counts)) {
+        transition_counts[from, to] <- counts[i, to]
+      }
+    }
+  }
+  
+  # Convert counts to probabilities
+  transition_probs <- prop.table(
+    transition_counts,
+    margin = 1
+  )
+  
+  return(list(
+    counts = transition_counts,
+    probabilities = transition_probs
+  ))
+}
+
+
+# Estimate a matrix for each quarter
+P_Q1 <- get_transition_matrix(chain_starts2, 1)
+P_Q2 <- get_transition_matrix(chain_starts2, 2)
+P_Q3 <- get_transition_matrix(chain_starts2, 3)
+P_Q4 <- get_transition_matrix(chain_starts2, 4)
+
+
+# Put the four quarter matrices into a 3D array
+P_array <- array(
+  c(P_Q1$probabilities, P_Q2$probabilities, P_Q3$probabilities, P_Q4$probabilities),
+  dim = c(nrow(P_Q1$probabilities), ncol(P_Q1$probabilities), 4)
+)
+
+P_array
+
+# Standard deviation across quarters
+sd_matrix <- apply(P_array, c(1, 2), sd)
+
+# Make sure row/column names are retained
+dimnames(sd_matrix) <- list(new_order, new_order)
+
+#new version of this plot
+plot_data <- as.data.frame(as.table(sd_matrix))
+colnames(plot_data) <- c("From", "To", "SD")
+
+# Convert SDs to percentage points
+plot_data$SD <- plot_data$SD * 100
+
+# Force rows and columns to use the same ordering
+state_order <- rownames(sd_matrix)
+
+plot_data$From <- factor(plot_data$From, levels = rev(state_order))
+plot_data$To <- factor(plot_data$To, levels = state_order)
+
+# Labels for standard deviations
+plot_data$Label <- sprintf("%.2f", plot_data$SD)
+plot_data$Label[plot_data$SD == 0] <- "0"
+
+p_qbyqtrans_sd <- ggplot(
+  plot_data,
+  aes(x = To, y = From, fill = SD)
+) +
+  geom_tile(colour = "grey80", linewidth = 0.3) +
+  geom_text(aes(label = Label), size = 4) +
+  scale_fill_gradientn(
+    colours = c("white", "lightsteelblue1", "steelblue1")
+  ) +
+  scale_x_discrete(position = "bottom") +
+  scale_y_discrete(position = "left") +
+  coord_fixed() +
+  theme_minimal() +
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 10),
+    legend.position = "none",
+    panel.grid = element_blank()
+  ) +
+  labs(
+    title = "SD of Transition Probabilities Across Quarters (x10^-2)"
+  )
+
+p_qbyqtrans_sd
+
+# Which transitions change the most qbyq
+# Quarter-specific matrices
+P_list <- list(
+  Q1 = P_Q1$probabilities,
+  Q2 = P_Q2$probabilities,
+  Q3 = P_Q3$probabilities,
+  Q4 = P_Q4$probabilities
+)
+
+# Convert a transition matrix to a long data frame
+matrix_to_df <- function(P) {
+  as.data.frame(P) %>%
+    rownames_to_column("from") %>%
+    pivot_longer(
+      -from,
+      names_to = "to",
+      values_to = "probability"
+    )
+}
+
+# Combine into one data frame
+transition_long <- bind_rows(
+  lapply(names(P_list), function(q) {
+    matrix_to_df(P_list[[q]]) %>%
+      mutate(Quarter = q)
+  })
+)
+
+transition_changes <- transition_long %>%
+  select(from, to, Quarter, probability) %>%
+  pivot_wider(
+    names_from = Quarter,
+    values_from = probability
+  ) %>%
+  mutate(
+    Q2_Q1 = Q2 - Q1,
+    Q3_Q2 = Q3 - Q2,
+    Q4_Q3 = Q4 - Q3,
+    Q4_Q1 = Q4 - Q1,
+    max_change = pmax(
+      abs(Q2_Q1),
+      abs(Q3_Q2),
+      abs(Q4_Q3)
+    )
+  ) %>%
+  arrange(desc(max_change))
+
+transition_changes
+
+```
+
+## QbyQ version of truncated simulator helper function
+```{r truncated gamma sim qbyq}
+truncated_gamma_discrete_sim_qbyq <- function(P_Q1, P_Q2, P_Q3, P_Q4, gamma_params, init_state, time, quarter, home, away, scale = FALSE){
+  
+  #Initial values
+  current_state <- init_state
+  t <- time
+  quarter_time <- 20*60 #constant
+  home_start <- home
+  away_start <- away
+  first_state <- TRUE
+  
+  # Store transition matrices in a list
+  P_lists <- list(
+    P_Q1 = P_Q1,
+    P_Q2 = P_Q2,
+    P_Q3 = P_Q3,
+    P_Q4 = P_Q4
+  )
+  
+  # Set P for current Q
+  P_list <- P_lists[[paste0("P_Q", quarter)]]
+  
+  #faster gamma 
+  states <- names(gamma_params)
+  state_index <- setNames(seq_along(states), states)
+  
+  
+  #Finish current quarter
+  while (t < quarter_time) {
+      params <- gamma_params[[current_state]]
+
+      # if rate is NA or 0, force dt = 0
+      if(is.null(params)){
+        dt <- 0
+      } else if (params$type == "gamma") {
+        dt <- rgamma(1,shape = params$shape, rate = params$rate)
+      } else if (params$type == "gamma_mixture") {
+        component <- sample(
+          1:length(params$lambda),
+          size = 1,
+          prob = params$lambda
+        )
+        dt <- rgamma(
+          1,
+          shape = params$alpha[component],
+          scale = params$beta[component]
+        )
+      } else {
+        # BIG ERROR
+        stop("Unknown distribution type: ", params$type)
+      }
+      
+      if (!first_state){
+        #Update score
+        if (current_state == "HG"){
+          home <- home + 6
+        }
+        if (current_state == "HB"){
+          home <- home + 1
+        }
+        if (current_state == "AG"){
+          away <- away + 6
+        }
+        if (current_state == "AB"){
+          away <- away + 1
+        }
+      }
+        first_state <- FALSE
+        
+      t <- t + dt
+      if (t > quarter_time) break
+      
+      # sample next state
+      next_info <- P_list[[current_state]]
+      if (is.null(next_info) || length(next_info$next_states) == 0) {
+      stop(
+        "No valid transitions from state: ", current_state,
+        " in quarter: ", q)
+      }
+      next_state <- sample(next_info$next_states, size = 1, 
+                           prob = next_info$probs)
+      
+      
+      current_state <- next_state
+    }
+  
+  
+  #Finish remaining quarters
+  if (quarter < 4){
+    for (q in (quarter+1):4){
+      
+      current_state <- "N_M"
+      t <- 0
+      
+      P_list <- P_lists[[paste0("P_Q", q)]]
+      
+      while (t < quarter_time) {
+        params <- gamma_params[[current_state]]
+  
+      # if rate is NA, force dt = 0
+      if(is.null(params)){
+        dt <- 0
+      } else if (params$type == "gamma") {
+        dt <- rgamma(1,shape = params$shape, rate = params$rate)
+      } else if (params$type == "gamma_mixture") {
+        component <- sample(
+          1:length(params$lambda),
+          size = 1,
+          prob = params$lambda
+        )
+        dt <- rgamma(
+          1,
+          shape = params$alpha[component],
+          scale = params$beta[component]
+        )
+      } else {
+        # BIG ERROR
+        stop("Unknown distribution type: ", params$type)
+      }
+  
+        #Update score
+        if (current_state == "HG"){
+          home <- home + 6
+        }
+        if (current_state == "HB"){
+          home <- home + 1
+        }
+        if (current_state == "AG"){
+          away <- away + 6
+        }
+        if (current_state == "AB"){
+          away <- away + 1
+        }
+          
+        t <- t + dt
+        if (t > quarter_time) break
+        
+        # sample next state
+        next_info <- P_list[[current_state]]
+        if (is.null(next_info) || length(next_info$next_states) == 0) {
+  stop(
+    "No valid transitions: state = ", current_state,
+    ", quarter = ", q
+  )
+}
+        next_state <- sample(next_info$next_states, size = 1, prob = next_info$probs)
+        
+        current_state <- next_state
+      }
+    
+    }
+  }
+  
+  if (scale == TRUE){
+    home <- home_start +
+        scale_factor * (home - home_start)
+    away <- away_start +
+        scale_factor * (away - away_start)
+  }
+  
+  forecast <- list(
+  home_forecast = home,
+  away_forecast = away
+)
+  return(forecast)
+}
+```
+
+## Qbyq version of selective simulator
+```{r qbyq bayesian score forecast selective qbyq}
+
+bayesian_score_forecast_selective_qbyq <- function(pbp,prior,nreps = 10, alpha = 0.01, scale = FALSE){
+  
+  # Priors
+  P <- prior$P_Q1
+  
+    P_sim <- list(
+      P_Q1 = prior$P_Q1,
+      P_Q2 = prior$P_Q2,
+      P_Q3 = prior$P_Q3,
+      P_Q4 = prior$P_Q4
+    )
+  
+  prior_gamma <- prior$gamma
+  
+  #Lets assume that we have already filtered the pbp to be the chain starts
+  
+  #Create a vector of match times
+  cs_quarter_lengths <- tapply(pbp$match_time, pbp$Quarter, function(x) max(x, na.rm = TRUE))
+  time <- pbp$match_time
+  match_length <-  max(time, na.rm = TRUE)
+  
+  #Empty vectors for scores and predicted scores
+  n <- length(time)
+quarter_forecasts <- data.frame(
+  Quarter = integer(),
+  Home_Score = integer(),
+  Away_Score = integer(),
+  Home_Forecast = numeric(),
+  Away_Forecast = numeric(),
+  Home_Win_Rate = numeric()
+)
+  
+  #Score counters
+  home <- 0
+  away <- 0
+  
+  #Quater ends
+  quarter_end <- c(
+  which(pbp$Quarter[-nrow(pbp)] != pbp$Quarter[-1]),
+  nrow(pbp)
+)
+  
+  #Loop through the entire pbp
+  for (i in 1:n){
+    pbprow <- pbp[i,]
+    state <- pbprow$pos_and_loc
+    next_state <- pbprow$next_pos_and_loc
+    
+    #Update real score if necessary
+    if (state == "HG"){
+      home <- home + 6
+    }
+    if (state == "HB"){
+      home <- home + 1
+    }
+    if (state == "AG"){
+      away <- away + 6
+    }
+    if (state == "AB"){
+      away <- away + 1
+    }
+
+    #Update gamma params
+    
+    #Update P matrix
+    P[state, ] <- (1 - alpha) * P[state, ]
+    P[state, next_state] <- P[state, next_state] + alpha
+    
+    # ACTUALLY update all the priors based on what has occured
+    P_sim$P_Q1[state, ] <- (1 - alpha) * P_sim$P_Q1[state, ]
+    P_sim$P_Q1[state, next_state] <- P_sim$P_Q1[state, next_state] + alpha
+    P_sim$P_Q2[state, ] <- (1 - alpha) * P_sim$P_Q2[state, ]
+    P_sim$P_Q2[state, next_state] <- P_sim$P_Q2[state, next_state] + alpha
+    P_sim$P_Q3[state, ] <- (1 - alpha) * P_sim$P_Q3[state, ]
+    P_sim$P_Q3[state, next_state] <- P_sim$P_Q3[state, next_state] + alpha
+    P_sim$P_Q4[state, ] <- (1 - alpha) * P_sim$P_Q4[state, ]
+    P_sim$P_Q4[state, next_state] <- P_sim$P_Q4[state, next_state] + alpha
+    
+    
+    #Find "adjusted time"
+    quarter <- pbp$Quarter[i]
+    time_adjusted <- ifelse(quarter>1, (time[i] - cs_quarter_lengths[quarter-1]) / (cs_quarter_lengths[quarter] - cs_quarter_lengths[quarter-1]) * 1200, time[i] / cs_quarter_lengths[1] * 1200) 
+    #Run simulations to forecast score
+    forecast_sum <- c(0,0)
+    home_wins <- 0
+    
+if (i %in% quarter_end){
+
+    forecast_sum <- c(0,0)
+    home_wins <- 0
+      
+      # Replace the current quarter's prior with its
+      # Bayesian-updated matrix
+      P_sim[[paste0("P_Q", quarter)]] <- P
+   
+    for (k in 1:nreps){
+
+        forecast <- truncated_gamma_discrete_sim_qbyq(
+          P_conv(P_sim$P_Q1),P_conv(P_sim$P_Q2),P_conv(P_sim$P_Q3),
+          P_conv(P_sim$P_Q4),
+          prior_gamma,
+          state,
+          time_adjusted,
+          quarter,
+          home,
+          away,
+          scale
+        )
+
+        forecast_sum <- forecast_sum +
+          c(forecast$home_forecast,
+            forecast$away_forecast)
+
+        if (forecast$home_forecast > forecast$away_forecast){
+          home_wins <- home_wins + 1
+        }
+    }
+
+    quarter_forecasts <- rbind(
+      quarter_forecasts,
+      data.frame(
+        Quarter = quarter,
+        Home_Score = home,
+        Away_Score = away,
+        Home_Forecast = forecast_sum[1]/nreps,
+        Away_Forecast = forecast_sum[2]/nreps,
+        Home_Win_Rate = home_wins/nreps
+      )
+    )
+    
+    # Change the p for new quarter
+    if (quarter == 1){
+      P <- prior$P_Q2
+    } else if (quarter ==2 ){
+      P <- prior$P_Q3
+    } else if (quarter == 3){
+      P <- prior$P_Q4
+    }
+}
+    
+  }
+  
+  return(quarter_forecasts)
+}
+
+```
+
+## QbyQ match prior helper function
+```{r pooled match prior for qbyq}
+get_pooled_match_prior_qbyq <- function(chain_starts, home_team, 
+                                     away_team, exclude = match) {
+  
+  pooled_data <- chain_starts %>%
+    filter(
+      (Home == home_team | Away == away_team)
+    )
+  
+  if (!is.na(exclude)) {
+  pooled_data <- pooled_data %>%
+    filter(Match_id != exclude)
+  }
+  
+    transition_states <- c(
+    "HG", "HB", "AK",
+    "H_H50", "N_H50", "A_H50",
+    "H_M", "N_M", "A_M",
+    "H_A50", "N_A50", "A_A50",
+    "HK", "AB", "AG"
+  )
+  
+  # Function to calculate P for one quarter
+  get_P <- function(data, quarter) {
+    
+    quarter_data <- data %>%
+      filter(
+        Quarter == quarter,
+        !is.na(next_pos_and_loc)
+      )
+    
+    transition_counts <- table(
+  factor(quarter_data$pos_and_loc, levels = transition_states),
+  factor(quarter_data$next_pos_and_loc, levels = transition_states)
+)
+    
+    P <- prop.table(transition_counts, margin = 1)
+    
+    # Rows with no observed transitions will contain NaN
+    P[is.nan(P)] <- 0
+    
+    return(P)
+  }
+  
+  # Get one transition matrix for each quarter
+  P_Q1 <- get_P(pooled_data, 1)
+  P_Q2 <- get_P(pooled_data, 2)
+  P_Q3 <- get_P(pooled_data, 3)
+  P_Q4 <- get_P(pooled_data, 4)
+  
+  # States with holding times
+  valid_states <- c(
+    "A_A50", "A_M", "A_H50",
+    "H_A50", "H_M", "H_H50"
+  )
+  
+  time_data <- pooled_data %>%
+    filter(
+      pos_and_loc %in% valid_states,
+      pos_and_loc_time > 0
+    )
+  
+  # -----------------------------
+  # Ordinary gamma states
+  # -----------------------------
+  
+  gamma_states <- c(
+    "A_H50", "A_M",
+    "H_A50", "H_M"
+  )
+  
+  gamma_params <- list()
+  
+  for (state in gamma_states) {
+    
+    x <- time_data %>%
+      filter(pos_and_loc == state) %>%
+      pull(pos_and_loc_time)
+    
+    fit <- fitdistr(x, "gamma")
+    
+    gamma_params[[state]] <- list(
+      type = "gamma",
+      shape = unname(fit$estimate["shape"]),
+      rate = unname(fit$estimate["rate"])
+    )
+  }
+  
+  # -----------------------------
+  # Mixture gamma states
+  # -----------------------------
+  
+  mixture_states <- c("A_A50", "H_H50")
+  
+  for (state in mixture_states) {
+    
+    x <- time_data %>%
+      filter(pos_and_loc == state) %>%
+      pull(pos_and_loc_time)
+    
+    fit <- mixtools::gammamixEM(x,k = 2, maxit= 5000, verb = FALSE)
+    
+    gamma_params[[state]] <- list(
+      type = "gamma_mixture",
+      alpha = fit$gamma.pars["alpha", ],
+      beta = fit$gamma.pars["beta", ],
+      lambda = fit$lambda
+    )
+  }
+  
+  return(list(
+    P_Q1 = P_Q1,
+    P_Q2 = P_Q2,
+    P_Q3 = P_Q3,
+    P_Q4 = P_Q4,
+    gamma = gamma_params
+  ))
+}
+```
+
+
+##Simulated qbyq errors
+```{r qbyq model errors}
+season_simulator_qbyq <- function(chain_starts,nreps,alpha,scale=FALSE){
+  all_results <- list()         
+  
+  counter <- 0
+  for (match in unique(chain_starts$Match_id)) {
+    if(counter %% 10 == 1){cat("i =", counter, "/", 22*9, "\n")}
+    # Split target match
+    test_match <- chain_starts %>%
+      filter(Match_id == match)
+    
+    test_match <- test_match %>%
+  filter(!is.na(next_pos_and_loc))
+    
+    # Extract teams and score
+    home_team <- unique(test_match$Home)
+    away_team <- unique(test_match$Away)
+    
+    # Build prior excluding this match
+    priors <- get_pooled_match_prior_qbyq(chain_starts, home_team, 
+                                     away_team, exclude = match)
+    
+    # Run Bayesian forecast
+    forecast <- bayesian_score_forecast_selective_qbyq(
+      test_match,
+      priors,
+      nreps,
+      alpha,
+      scale
+    )
+    
+    final_home <- forecast$Home_Score[forecast$Quarter == 4]
+    final_away <- forecast$Away_Score[forecast$Quarter == 4]
+    
+    # Compute error
+    forecast <- forecast %>%
+  mutate(
+    Match_id = match,
+    Home_Team = unique(test_match$Home),
+    Away_Team = unique(test_match$Away),
+    Final_Home = final_home,
+    Final_Away = final_away,
+    Home_Error = abs(Home_Forecast - final_home),
+    Away_Error = abs(Away_Forecast - final_away),
+    Score_MAE = (Home_Error + Away_Error)/2
+  )
+    
+    # Store
+    all_results[[match]] <- forecast
+    
+    
+    counter <- counter + 1;
+  }
+  
+  results <- bind_rows(all_results)
+  return(results)
+}
+
+# each takes a while like an hour or smth
+
+season_forecasts2_qbyq_null <- suppressWarnings(season_simulator_qbyq(chain_starts2,1000,0,FALSE))
+season_forecasts2_qbyq_0001 <- suppressWarnings(season_simulator_qbyq(chain_starts2,1000,0.001,FALSE))
+season_forecasts2_qbyq_0002 <- suppressWarnings(season_simulator_qbyq(chain_starts2,1000,0.002,FALSE))
+season_forecasts2_qbyq_0005 <- suppressWarnings(season_simulator_qbyq(chain_starts2,1000,0.005,FALSE))
+season_forecasts2_qbyq_001 <- suppressWarnings(season_simulator_qbyq(chain_starts2,1000,0.01,FALSE))
+season_forecasts2_qbyq_002 <- suppressWarnings(season_simulator_qbyq(chain_starts2,1000,0.02,FALSE))
+
+ season_forecasts2_qbyq_0003 <- suppressWarnings(season_simulator_qbyq(chain_starts2,1000,0.003,FALSE))
+ season_forecasts2_qbyq_0007 <- suppressWarnings(season_simulator_qbyq(chain_starts2,1000,0.007,FALSE))
+ season_forecasts2_qbyq_0004 <- suppressWarnings(season_simulator_qbyq(chain_starts2,1000,0.004,FALSE))
+ season_forecasts2_qbyq_0006 <- suppressWarnings(season_simulator_qbyq(chain_starts2,1000,0.006,FALSE))
+ season_forecasts2_qbyq_0008 <- suppressWarnings(season_simulator_qbyq(chain_starts2,1000,0.008,FALSE))
+
+```
+
+# Section 7.4
+
+## All models comparison table
+
+```{r comparison errors}
+# Calculate forecast errors
+
+# Function to calculate forecast errors
+calculate_forecast_errors <- function(x) {
+  x %>%
+    filter(Quarter < 4) %>%
+    mutate(
+      Home_Bias = Home_Forecast - Final_Home,
+      Away_Bias = Away_Forecast - Final_Away,
+      Home_Abs_Error = abs(Home_Forecast - Final_Home),
+      Away_Abs_Error = abs(Away_Forecast - Final_Away),
+      Total_Abs_Error = Home_Abs_Error + Away_Abs_Error
+    )
+}
+
+# List of forecast objects
+forecast_names <- c(
+  "null",
+  "dirichlet",
+  "dirichlet10",
+  "dirichlet5",
+  "dirichlet50",
+  "dirichlet20",
+  "dirichlet2",
+  "dirichlet3",
+  "dirichlet4",
+  "dirichlet6",
+  "dirichlet7",
+  "dirichlet8",
+  "dirichlet9",
+  "ewma_alpha001",
+  "ewma_alpha002",
+  "ewma_alpha005",
+  "ewma_alpha01",
+  "ewma_alpha0001",
+  "ewma_alpha0002",
+  "ewma_alpha0005",
+  "ewma_alpha0003",
+  "ewma_alpha0004",
+  "ewma_alpha0006",
+  "ewma_alpha0007",
+  "ewma_alpha0008",
+  "qbyq_null",
+  "qbyq_0001",
+  "qbyq_0002",
+  "qbyq_0005",
+  "qbyq_0003",
+  "qbyq_0004",
+  "qbyq_0006",
+  "qbyq_0007",
+  "qbyq_0008",
+  "qbyq_001",
+  "qbyq_002"
+)
+
+
+# Apply function to each forecast object
+for (name in forecast_names) {
+  forecast_object <- get(paste0("season_forecasts2_", name))
+  assign(
+    paste0("forecast_errors_", name),
+    calculate_forecast_errors(forecast_object)
+  )
+}
+
+# Map object suffixes to model labels
+model_labels <- c(
+  null = "Null model",
+  extrapolations_errors = "Extrapolation model",
+  
+  ewma_alpha001 = "EWMA model 0.01",
+  ewma_alpha002 = "EWMA model 0.02",
+  ewma_alpha005 = "EWMA model 0.05",
+  ewma_alpha01 = "EWMA model 0.1",
+  ewma_alpha0001 = "EWMA model 0.001",
+  ewma_alpha0002 = "EWMA model 0.002",
+  ewma_alpha0005 = "EWMA model 0.005",
+  ewma_alpha0003 = "EWMA model 0.003",
+  ewma_alpha0004 = "EWMA model 0.004",
+  ewma_alpha0006 = "EWMA model 0.006",
+  ewma_alpha0007 = "EWMA model 0.007",
+  ewma_alpha0008 = "EWMA model 0.008",
+  
+  dirichlet = "Dirichlet model",
+  dirichlet2 = "Dirichlet model 2",
+  dirichlet3 = "Dirichlet model 3",
+  dirichlet4 = "Dirichlet model 4",
+  dirichlet5 = "Dirichlet model 5",
+  dirichlet6 = "Dirichlet model 6",
+  dirichlet7 = "Dirichlet model 7",
+  dirichlet8 = "Dirichlet model 8",
+  dirichlet9 = "Dirichlet model 9",
+  dirichlet10 = "Dirichlet model 10",
+  dirichlet20 = "Dirichlet model 20",
+  dirichlet50 = "Dirichlet model 50",
+  
+  qbyq_null = "QbyQ model 0",
+  qbyq_001 = "QbyQ model 0.01",
+  qbyq_002 = "QbyQ model 0.02",
+  qbyq_0005 = "QbyQ model 0.005",
+  qbyq_0006 = "QbyQ model 0.006",
+  qbyq_0007 = "QbyQ model 0.007",
+  qbyq_0008 = "QbyQ model 0.008",
+  qbyq_0003 = "QbyQ model 0.003",
+  qbyq_0004 = "QbyQ model 0.004",
+  qbyq_0002 = "QbyQ model 0.002",
+  qbyq_0001 = "QbyQ model 0.001"
+)
+
+# Combine all error data frames
+comparison_errors <- bind_rows(
+  lapply(names(model_labels), function(name) {
+    
+    # Extrapolation has a slightly different object name
+        if (name == "extrapolations_errors") {
+      data <- forecast_extrapolations_errors %>%
+        mutate(
+          Home_Bias = Home_Forecast - Final_Home,
+          Away_Bias = Away_Forecast - Final_Away,
+          Home_Abs_Error = abs(Home_Forecast - Final_Home),
+          Away_Abs_Error = abs(Away_Forecast - Final_Away),
+          Total_Abs_Error = Home_Abs_Error + Away_Abs_Error
+        )
+    } else {
+      data <- get(paste0("forecast_errors_", name))
+    }
+    
+    data %>%
+      mutate(Model = model_labels[[name]])
+  })
+)
+
+error_summary <- comparison_errors %>%
+  select(Model, Quarter, Home_Bias, Away_Bias,
+         Home_Abs_Error, Away_Abs_Error) %>%
+  group_by(Model, Quarter) %>%
+  summarise(
+    Home_Bias = mean(Home_Bias),
+    Away_Bias = mean(Away_Bias),
+    Home_MAE = mean(Home_Abs_Error),
+    Away_MAE = mean(Away_Abs_Error),
+    .groups = "drop"
+  )
+
+error_summary
+
+overall_summary <- error_summary %>%
+  group_by(Model) %>%
+  summarise(
+    Home_Bias = mean(abs(Home_Bias)),
+    Away_Bias = mean(abs(Away_Bias)),
+    Home_MAE = mean(Home_MAE),
+    Away_MAE = mean(Away_MAE),
+    Overall_MAE = (mean(Home_MAE) + mean(Away_MAE))/2,
+    .groups = "drop"
+  ) %>% arrange(Overall_MAE)
+overall_summary
+
+```
+
+## Compare each to null
+```{r compare to null}
+# Compare each model against the Null model
+
+model_difference <- comparison_errors %>%
+  select(Match_id, Quarter, Model, Total_Abs_Error) %>%
+  pivot_wider(
+    names_from = Model,
+    values_from = Total_Abs_Error
+  ) %>%
+  pivot_longer(
+    cols = -c(Match_id, Quarter, `Null model`),
+    names_to = "Model",
+    values_to = "Model_Error"
+  ) %>%
+  mutate(
+    Difference = Model_Error - `Null model`
+  )
+
+
+# ---------------------------------------------------------
+# Calculate mean difference and 95% CI
+
+model_difference_summary <- model_difference %>%
+  group_by(Model, Quarter) %>%
+  summarise(
+    Mean_Difference = mean(Difference, na.rm = TRUE),
+    SD = sd(Difference, na.rm = TRUE),
+    n = sum(!is.na(Difference)),
+    SE = SD / sqrt(n),
+    CI = qt(0.975, df = n - 1) * SE,
+    CI_lower = Mean_Difference - CI,
+    CI_upper = Mean_Difference + CI,
+    .groups = "drop"
+  )
+model_difference_summary
+
+```
+
+
+## Null vs extrapolation plots ?
+```{r null vs extrapolation}
+p <- ggplot(
+  comparison_errors %>%
+    filter(Model %in% c("Null model", "Extrapolation model")),
+  aes(x = Total_Abs_Error, fill = Model)
+) +
+  geom_histogram(
+    bins = 30,
+    alpha = 0.5,
+    position = "identity"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_wrap(
+  ~ factor(
+    Quarter,
+    levels = c(1, 2, 3),
+    labels = c("QT", "HT", "3QT")
+  )
+) +
+  labs(
+    title = "Total Absolute Error Histograms by Quarter Break",
+    x = "Total Absolute Error",
+    y = "Count",
+    fill = "Model"
+  ) +
+  theme_minimal()
+
+p
+
+```
+
+## Null vs Dirichlet 1 plot
+```{r null vs dirichlet 1}
+
+p <- ggplot(
+  comparison_errors %>%
+    filter(Model %in% c("Null model", "Dirichlet model")),
+  aes(x = Total_Abs_Error, fill = Model)
+) +
+  geom_histogram(
+    bins = 30,
+    alpha = 0.5,
+    position = "identity"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_wrap(
+  ~ factor(
+    Quarter,
+    levels = c(1, 2, 3),
+    labels = c("QT", "HT", "3QT")
+  )) +
+  labs(
+    title = "Total Absolute Error Histograms by Quarter Break",
+    x = "Total Absolute Error",
+    y = "Count",
+    fill = "Model"
+  ) +
+  theme_minimal()
+
+p
+```
+
+
+## Null vs Dirichlet plots
+```{r null vs dirichlet}
+# Dirichlet factors
+
+dirichlet_difference_summary <- model_difference_summary %>%
+  filter(grepl("^Dirichlet", Model)) %>%
+  mutate(
+    Factor = case_when(
+      Model == "Dirichlet model" ~ 1,
+      TRUE ~ as.numeric(
+        sub("Dirichlet model ", "", Model)
+      )
+    ),
+    Factor = factor(
+      Factor,
+      levels = c(1, 2, 3, 4, 5,6,7,8,9, 10, 20, 50)
+    )
+  )
+
+# Remove the large ones
+dirichlet_difference_summary <- dirichlet_difference_summary %>% 
+  filter(
+    !Model %in% c("Dirichlet model 20", "Dirichlet model 50")
+  )
+
+
+# ---------------------------------------------------------
+# Dirichlet plot
+
+p_dirichlet <- ggplot(
+  dirichlet_difference_summary,
+  aes(
+    x = Factor,
+    y = Mean_Difference,
+    colour = Factor
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linewidth = 0.7,
+    colour = "grey50"
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = CI_lower,
+      ymax = CI_upper
+    ),
+    width = 0.15,
+    linewidth = 0.7
+  ) +
+  geom_point(
+    size = 3
+  ) +
+  facet_wrap(
+  ~ factor(
+    Quarter,
+    levels = c(1, 2, 3),
+    labels = c("QT", "HT", "3QT")
+  ),
+  scales = "free_y"
+) +
+  scale_colour_viridis_d(option = "C") +
+  labs(
+    title = "Dirichlet Forecast Error Relative to the Null Model",
+    subtitle = "Difference in mean total absolute error with 95% confidence intervals",
+    x = "Dirichlet prior concentration factor",
+    y = "Change in Mean Total Absolute Error",
+    colour = "Prior factor"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 14
+    ),
+    plot.subtitle = element_text(
+      size = 10
+    ),
+    axis.title = element_text(
+      face = "bold"
+    ),
+    axis.text = element_text(
+      colour = "black"
+    ),
+    strip.text = element_text(
+      face = "bold",
+      size = 11
+    ),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom"
+  )
+
+p_dirichlet
+
+```
+
+
+## Null vs EWMA plots
+```{r null vs ewma}
+# EWMA factors
+
+ewma_difference_summary <- model_difference_summary %>%
+  filter(grepl("^EWMA", Model)) %>%
+  mutate(
+    Factor = case_when(
+      Model == "EWMA model 0.001"   ~ 0.001,
+      Model == "EWMA model 0.002"   ~ 0.002,
+      Model == "EWMA model 0.003"   ~ 0.003,
+      Model == "EWMA model 0.004"   ~ 0.004,
+      Model == "EWMA model 0.005"   ~ 0.005,
+      Model == "EWMA model 0.006"   ~ 0.006,
+      Model == "EWMA model 0.007"   ~ 0.007,
+      Model == "EWMA model 0.008"   ~ 0.008,
+      Model == "EWMA model 0.01"  ~ 0.01,
+      Model == "EWMA model 0.02" ~ 0.02,
+      Model == "EWMA model 0.05" ~ 0.05,
+      Model == "EWMA model 0.1" ~ 0.1,
+      TRUE ~ NA_real_
+    ),
+    Factor = factor(
+      Factor,
+      levels = c(0.001, 0.002,0.003,0.004, 0.005,0.006,0.007,0.008, 0.01, 0.02, 0.05, 0.1)
+    )
+  )
+ewma_difference_summary
+
+# Remove the large ones
+ewma_difference_summary <- ewma_difference_summary %>% 
+  filter(
+    !Model %in% c("EWMA model 0.1", "EWMA model 0.05")
+  )
+
+
+# ---------------------------------------------------------
+# EWMA plot
+
+p_ewma <- ggplot(
+  ewma_difference_summary,
+  aes(
+    x = Factor,
+    y = Mean_Difference,
+    colour = Factor
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linewidth = 0.7,
+    colour = "grey50"
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = CI_lower,
+      ymax = CI_upper
+    ),
+    width = 0.15,
+    linewidth = 0.7
+  ) +
+  geom_point(
+    size = 2
+  ) +
+  facet_wrap(
+  ~ factor(
+    Quarter,
+    levels = c(1, 2, 3),
+    labels = c("QT", "HT", "3QT")
+  ),
+  scales = "free_y"
+) +
+  scale_colour_viridis_d(option = "C") +
+  labs(
+    title = "EWMA Forecast Error Relative to the Null Model",
+    subtitle = "Difference in mean total absolute error with 95% confidence intervals",
+    x = expression(EWMA~factor~beta),
+    y = "Change in Mean Total Absolute Error",
+    colour = expression(beta)
+  ) +
+  theme_minimal(base_size = 11) +
+  theme_minimal(base_size = 11) +
+theme(
+  plot.title = element_text(
+    face = "bold",
+    size = 14
+  ),
+  plot.subtitle = element_text(
+    size = 10
+  ),
+  axis.title = element_text(
+    face = "bold"
+  ),
+  axis.text = element_text(
+    colour = "black"
+  ),
+  axis.text.x = element_text(
+    angle = 45,
+    hjust = 1
+  ),
+  strip.text = element_text(
+    face = "bold",
+    size = 11
+  ),
+  panel.grid.minor = element_blank(),
+  panel.grid.major.x = element_blank(),
+  legend.position = "bottom"
+)
+
+p_ewma
+
+```
+
+## Null vs QbyQ plots
+
+```{r null vs qbyq}
+# QbyQ factors
+
+qbyq_difference_summary <- model_difference_summary %>%
+  filter(grepl("^QbyQ", Model)) %>%
+  mutate(
+    Factor = case_when(
+      Model == "QbyQ model 0"     ~ 0,
+      Model == "QbyQ model 0.001" ~ 0.001,
+      Model == "QbyQ model 0.002" ~ 0.002,
+      Model == "QbyQ model 0.003" ~ 0.003,
+      Model == "QbyQ model 0.004" ~ 0.004,
+      Model == "QbyQ model 0.005" ~ 0.005,
+      Model == "QbyQ model 0.006" ~ 0.006,
+      Model == "QbyQ model 0.007" ~ 0.007,
+      Model == "QbyQ model 0.008" ~ 0.008,
+      Model == "QbyQ model 0.01"  ~ 0.01,
+      Model == "QbyQ model 0.02"  ~ 0.02,
+      TRUE ~ NA_real_
+    ),
+    Factor = factor(
+      Factor,
+      levels = c(0, 0.001, 0.002,0.003,0.004, 0.005,0.006,0.007,0.008, 0.01, 0.02)
+    )
+  )
+
+qbyq_difference_summary
+
+
+# ---------------------------------------------------------
+# QbyQ plot
+
+p_qbyq <- ggplot(
+  qbyq_difference_summary,
+  aes(
+    x = Factor,
+    y = Mean_Difference,
+    colour = Factor
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linewidth = 0.7,
+    colour = "grey50"
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = CI_lower,
+      ymax = CI_upper
+    ),
+    width = 0.15,
+    linewidth = 0.7
+  ) +
+  geom_point(
+    size = 2
+  ) +
+  facet_wrap(
+  ~ factor(
+    Quarter,
+    levels = c(1, 2, 3),
+    labels = c("QT", "HT", "3QT")
+  ),
+  scales = "free_y"
+) +
+  scale_colour_viridis_d(option = "C") +
+  labs(
+    title = "QbyQ Forecast Error Relative to the Null Model",
+    subtitle = "Difference in mean total absolute error with 95% confidence intervals",
+    x = expression(QbyQ~factor~beta),
+    y = "Change in Mean Total Absolute Error",
+    colour = expression(beta)
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 14
+    ),
+    plot.subtitle = element_text(
+      size = 10
+    ),
+    axis.title = element_text(
+      face = "bold"
+    ),
+    axis.text = element_text(
+      colour = "black"
+    ),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    strip.text = element_text(
+      face = "bold",
+      size = 11
+    ),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom"
+  )
+
+p_qbyq
+
+```
+
+# Section 7.5
+## Best models vs null, plots pvals, prop inproved and tables
+
+```{r best models vs null pvals}
+
+overall_summary <- overall_summary %>%
+  mutate(
+    Model_Type = case_when(
+      grepl("^Dirichlet", Model) ~ "Dirichlet",
+      grepl("^EWMA", Model) ~ "EWMA",
+      grepl("^Extrapolation", Model) ~ "Extrapolation",
+      grepl("^Null", Model) ~ "Null",
+      grepl("^QbyQ", Model) ~ "QbyQ",
+      TRUE ~ Model
+    ))
+
+# Select the best model within each model type
+best_models_overall <- overall_summary %>%
+  group_by(Model_Type) %>%
+  slice_min(Overall_MAE, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+(best_models_quarters <- error_summary[which(error_summary$Model %in% best_models_overall$Model),])
+
+best_models_overall
+
+# Calculate paired differences relative to the null model
+model_differences <- comparison_errors %>%
+  select(Match_id, Quarter, Model, Total_Abs_Error) %>%
+  left_join(
+    comparison_errors %>%
+      filter(Model == "Null model") %>%
+      select(Match_id, Quarter, Null_Error = Total_Abs_Error),
+    by = c("Match_id", "Quarter")
+  ) %>%
+   filter(Model %in% best_models_overall$Model) %>%
+  mutate(
+    Difference = Total_Abs_Error - Null_Error
+  )
+
+# One-sided paired t-tests
+significance_summary <- model_differences %>%
+  group_by(Model, Quarter) %>%
+  summarise(
+    Mean_Difference = mean(Difference, na.rm = TRUE),
+    SD = sd(Difference, na.rm = TRUE),
+    n = sum(!is.na(Difference)),
+    SE = SD / sqrt(n),
+    t_statistic = Mean_Difference / SE,
+    p_value = pt(t_statistic, df = n - 1),
+    CI_lower = Mean_Difference -
+      qt(0.975, df = n - 1) * SE,
+    CI_upper = Mean_Difference +
+      qt(0.975, df = n - 1) * SE,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adjusted = p.adjust(p_value, method = "holm"),
+    Significant = p_adjusted < 0.05
+  )
+
+significance_summary
+
+# Keep only the selected models
+plot_data <- model_differences %>%
+  filter(Model %in% best_models_overall$Model) %>%
+  filter(!(Model %in% "Null model")) %>%
+  filter(!(Model %in% "Extrapolation model"))
+
+
+# ---------------------------------------------------------
+# Distribution of difference in absolute error
+
+p <- ggplot(plot_data, aes(x = Difference, fill = Model)) +
+  geom_histogram(bins = 30) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_grid(
+    Model ~ Quarter,
+    scales = "free",
+    labeller = labeller(
+      Quarter = c(
+        `1` = "QT",
+        `2` = "HT",
+        `3` = "3QT"
+      )
+    )
+  ) +
+  labs(
+    title = "Distribution of Difference in Absolute Error Relative to the Null Model",
+    x = "Difference in absolute error (model - null)",
+    y = "Number of matches"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+p
+
+# ---------------------------------------------------------
+# Proportion of matches where model outperforms null
+
+proportion_improved <- plot_data %>%
+  group_by(Model, Quarter) %>%
+  summarise(
+    Proportion_Improved = mean(Difference < 0, na.rm = TRUE),
+    Percentage_Improved = 100 * Proportion_Improved,
+    n = sum(!is.na(Difference)),
+    .groups = "drop"
+  )
+
+proportion_improved
+
+#___________________________________________________________________________
+# Combine home and away forecasting errors
+error_data <- comparison_errors %>%
+  filter(Model %in% best_models_overall$Model) %>%
+  filter(!(Model %in% "Extrapolation model")) %>%
+  select(Match_id, Quarter, Model, Home_Error, Away_Error) %>%
+  tidyr::pivot_longer(
+    cols = c(Home_Error, Away_Error),
+    names_to = "Team",
+    values_to = "Error"
+  )
+
+error_summary2 <- error_data %>%
+  group_by(Model, Quarter) %>%
+  summarise(
+    Mean = mean(Error, na.rm = TRUE),
+    SD = sd(Error, na.rm = TRUE),
+    Q1 = quantile(Error, 0.25, na.rm = TRUE),
+    Median = median(Error, na.rm = TRUE),
+    Q3 = quantile(Error, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Quarter = recode(
+      Quarter,
+      `1` = "QT",
+      `2` = "HT",
+      `3` = "3QT"
+    )
+  )
+
+error_summary2
+
+```
+
+
+# Section 7.6
+## Bias of best models
+
+```{r best models bias}
+
+# add qbyq 0 for bias comparison
+best_models_quarters <- bind_rows(
+  best_models_quarters,
+  error_summary %>%
+    filter(Model == "QbyQ model 0")
+)
+
+best_models_quarters
+
+best_models_overall <- bind_rows(
+  best_models_overall,
+  overall_summary %>%
+    filter(Model == "QbyQ model 0")
+)
+
+best_models_overall
+
+```
+
+
+# Section 7.7
+
+## Tables of relative improvement
+```{r table of relative improvement}
+# Mean MAE across home and away teams
+best_models_mae <- best_models_quarters %>%
+  mutate(
+    Mean_MAE = (Home_MAE + Away_MAE) / 2
+  )
+
+# relative difference from null model
+relative_null_mae <- best_models_mae %>%
+  select(Model, Quarter, Mean_MAE) %>%
+  pivot_wider(
+    names_from = Quarter,
+    values_from = Mean_MAE
+  ) %>%
+  left_join(
+    best_models_mae %>%
+      filter(Model == "Null model") %>%
+      select(Quarter, Null_MAE = Mean_MAE) %>%
+      pivot_wider(
+        names_from = Quarter,
+        values_from = Null_MAE,
+        names_prefix = "Null_"
+      ),
+    by = character()
+  ) %>%
+  mutate(
+    QT = (`1` - Null_1) / Null_1 * 100,
+    HT = (`2` - Null_2) / Null_2 * 100,
+    `3QT` = (`3` - Null_3) / Null_3 * 100
+  ) %>%
+  select(Model, QT, HT, `3QT`) %>%
+  mutate(
+    across(c(QT, HT, `3QT`), ~ round(.x, 2))
+  )
+
+relative_null_mae
+
+# relative improvement between quarter breaks
+mae_improvement <- best_models_mae %>%
+  select(Model, Quarter, Mean_MAE) %>%
+  pivot_wider(
+    names_from = Quarter,
+    values_from = Mean_MAE
+  ) %>%
+  mutate(
+    `QT -> HT` = (`1` - `2`) / `1` * 100,
+    `HT -> 3QT` = (`2` - `3`) / `2` * 100,
+    `QT -> 3QT` = (`1` - `3`) / `1` * 100
+  ) %>%
+  select(Model, `QT -> HT`, `HT -> 3QT`, `QT -> 3QT`) %>%
+  mutate(
+    across(-Model, ~ round(.x, 2))
+  )
+
+mae_improvement
+
+
+```
+
+# Section 7.9
+
+## nreps
+
+```{r nreps}
+#n_values <- c(10,25,100,250,500,1000)
+n_values <- c(2000, 5000, 10000)
+
+test_nreps <- function(n_values, chain_starts, alpha, scaled){
+
+  results <- data.frame(
+  nreps = integer(),
+  Quarter = integer(),
+  runtime = numeric(),
+  MAE = numeric(),
+  SD_Error = numeric()
+  )
+
+  for (n in n_values){
+
+    cat("Running n =", n, "\n")
+
+    start <- Sys.time()
+
+    forecasts <- suppressWarnings(season_simulator(chain_starts,
+                                                   n,
+                                                   alpha,
+                                                   scaled))
+    end <- Sys.time()
+
+    runtime <- as.numeric(
+      difftime(end, start, units = "mins")
+    )
+
+    error_summary <- forecasts %>%
+      filter(Quarter < 4) %>%
+      group_by(Quarter) %>%
+      summarise(
+        MAE = mean(Score_MAE),
+        SD_Error = sd(Score_MAE)
+      )
+    
+    
+    results <- rbind(
+      results,
+      data.frame(
+        nreps = n,
+        Quarter = error_summary$Quarter,
+        runtime = runtime,
+        MAE = error_summary$MAE,
+        SD_Error = error_summary$SD_Error
+      )
+)
+  }
+
+  return(results)
+}
+
+(nreps_results <- test_nreps(n_values, chain_starts2, 0, FALSE))
+```
+
+
+# Section 7.11
+
+## Do holding times vary throughout a match
+```{r holing times qbyq}
+holding_time_tests <- chain_starts2 %>%
+  group_by(pos_and_loc) %>%
+  filter(pos_and_loc %in% c(
+    "A_A50","A_M","A_H50",
+    "H_A50","H_M","H_H50"
+  )) %>%
+  summarise(
+    p_value = kruskal.test(pos_and_loc_time ~ factor(Quarter))$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adjusted = p.adjust(p_value, method = "holm")
+  )
+
+holding_time_tests
+```
+
