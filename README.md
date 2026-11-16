@@ -18,6 +18,93 @@ https://github.com/alittlefitness/afl_play_by_play
 
 The data was originally sourced from afl.com.au and covers the 2021 AFL season.
 
+## Methodology
+
+### Data and State Construction
+
+The analysis uses play-by-play data from 199 matches of the 2021 AFL season, sourced from the publicly available dataset compiled by Richard Little. Each record contains time-stamped match events, including the event type, team and quarter.
+
+A 15-state representation of match progression was constructed by combining the team in possession (home, away or neutral) with the inferred location of the ball. The location component distinguishes between the teams' attacking 50-metre zones, midfield, and scoring-related states such as goals, behinds and kick-ins.
+
+Since the dataset does not contain precise player or ball tracking coordinates, field position is inferred from selected play-by-play events. Consequently, the spatial representation is relatively coarse, particularly in the midfield.
+
+#### AFL Field Partition
+
+![AFL Field Partition](figures/afl-field-partition.png)
+
+*Figure 1: Partition of the AFL field into location zones
+used in the semi-Markov model.*
+
+### Semi-Markov Model
+
+Match progression is represented using a discrete-state semi-Markov model. The sequence of states is modelled through a transition matrix, with transition probabilities estimated from the observed state sequences.
+
+Unlike a continuous-time Markov chain, the semi-Markov framework allows holding times to have distributions beyond the exponential family. This enables the model to account for differences in the time spent in different possession-location states.
+
+The fitted model is examined through its transition structure, holding-time distributions, long-run behaviour, expected scoring rates and convergence towards its stationary distribution. Monte Carlo simulations are also used to investigate whether the model reproduces the broad scoring characteristics observed in the 2021 season.
+
+#### State Transition Diagram
+
+![State Transition Diagram](figures/state-transitions.png)
+
+*Figure 2: Common transitions between location-possession
+states.*
+
+# Bayesian Forecasting
+
+The semi-Markov framework is extended to forecast final match scores using several approaches to incorporate information observed during an ongoing match:
+
+Null model: Uses fixed historical transition probabilities as a baseline.
+
+Dirichlet model: Updates transition probabilities using current-match observations through Bayesian conjugate updating.
+
+Exponentially Weighted Moving Average (EWMA): Gives greater weight to more recent match observations when updating transition probabilities.
+
+Quarter-by-quarter model: Allows transition probabilities to vary between quarters to account for systematic changes in match dynamics.
+
+The forecasting approaches are compared using mean absolute error (MAE), prediction bias and the consistency of improvements over the historical baseline.
+
+#### Richmond vs Carlton Null Model Forecast
+[View the forecast versus actual plots](figures/forecastvsactual_richcarl.pdf)
+
+*Figure 3: Comparison of predicted and actual scores throughout the 2021 Round 1 Richmond versus Carlton match, illustrating how the model's forecasts evolve as additional match information becomes available.*
+
+[View the home win probability plot](figures/diffswinprob_richcarl.pdf)
+
+*Figure 4: Evolution of the home team's win probability throughout the 2021 Round 1 Richmond versus Carlton match, estimated through repeated simulations of the remaining match.*
+
+## Key Results
+
+### Semi-Markov Model
+
+The fitted model captures meaningful structure in AFL possession and location dynamics. Its transition matrix exhibits an approximately banded structure, with transitions between neighbouring possession-location states dominating the process.
+
+The model broadly reproduces the average scoring levels observed during the 2021 season. Simulated matches produce average scores of approximately 79.0 points for the home team and 74.5 points for the away team, compared with observed seasonal averages of approximately 79.8 and 75.4 points, respectively.
+
+The model also exhibits relatively rapid convergence towards its stationary distribution, with a second-largest eigenvalue modulus of approximately 0.604. This supports the use of long-run quantities to investigate the proportion of transitions and time spent in different states.
+
+### Forecasting Performance
+
+The adaptive forecasting approaches produce modest improvements over the historical baseline. The EWMA model with a weighting parameter of β = 0.002 achieves the lowest overall mean absolute error of approximately 11.705 points, compared with 11.769 for the null model.
+
+However, the improvements are relatively small and are not statistically significant after applying the Holm adjustment for multiple comparisons.
+
+The quarter-by-quarter model does not achieve the lowest overall mean absolute error, but substantially reduces systematic prediction bias, particularly for away-team scores. This suggests that allowing scoring dynamics to vary throughout a match can provide benefits beyond simply increasing the weight assigned to recent observations.
+
+Overall, the results highlight a trade-off between adapting to current-match information and retaining the stability of historical estimates.
+
+#### Forecast Bias by Checkpoint
+
+[View the forecast bias plots](figures/forecast_bias_by_checkpoint.pdf)
+
+*Figure 5: Comparison of forecast bias across quarter-time, half-time and three-quarter-time checkpoints, illustrating systematic differences between predicted and observed final scores.*
+
+#### Forecast MAE by Checkpoint
+
+[View the forecast MAE plots](figures/forecast_mae_by_checkpoint.pdf)
+
+*Figure 6: Mean absolute error of final-score forecasts across quarter-time, half-time and three-quarter-time checkpoints, comparing the predictive accuracy of the forecasting approaches.*
+
 ## Citation
 
 If you use the code from this repository, please cite:
