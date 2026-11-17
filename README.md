@@ -30,7 +30,7 @@ Since the dataset does not contain precise player or ball tracking coordinates, 
 
 #### AFL Field Partition
 
-![AFL Field Partition](figures/afl-field-partition.png)
+[AFL Field Partition](figures/afl-field-partition.png)
 
 *Figure 1: Partition of the AFL field into location zones
 used in the semi-Markov model.*
@@ -45,7 +45,7 @@ The fitted model is examined through its transition structure, holding-time dist
 
 #### State Transition Diagram
 
-![State Transition Diagram](figures/state-transitions.png)
+[State Transition Diagram](figures/state-transitions.png)
 
 *Figure 2: Common transitions between location-possession
 states.*
