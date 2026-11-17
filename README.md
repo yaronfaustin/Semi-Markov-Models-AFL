@@ -30,7 +30,7 @@ Since the dataset does not contain precise player or ball tracking coordinates, 
 
 #### AFL Field Partition
 
-[AFL Field Partition](figures/afl-field-partition.png)
+[AFL Field Partition](figures/afl_partition_diagram.png)
 
 *Figure 1: Partition of the AFL field into location zones
 used in the semi-Markov model.*
@@ -45,14 +45,14 @@ The fitted model is examined through its transition structure, holding-time dist
 
 #### State Transition Diagram
 
-[State Transition Diagram](figures/state-transitions.png)
+[State Transition Diagram](figures/Transition_Flowchart.png)
 
 *Figure 2: Common transitions between location-possession
 states.*
 
 #### Holding Time Distributions
 
-[View the holding time distributions](figures/holding_time_distributions.pdf)
+[Holding time distributions](figures/holding_time_distributions.pdf)
 
 *Figure 3: Distributions of holding times across the states of the semi-Markov model, illustrating the variation in time spent in each possession-location state before transitioning to another state.*
 
@@ -71,11 +71,11 @@ Quarter-by-quarter model: Allows transition probabilities to vary between quarte
 The forecasting approaches are compared using mean absolute error (MAE), prediction bias and the consistency of improvements over the historical baseline.
 
 #### Richmond vs Carlton Null Model Forecast
-[View the forecast versus actual plots](figures/forecastvsactual_richcarl.pdf)
+[Forecast versus actual plots](figures/forecastvsactual_richcarl.pdf)
 
 *Figure 4: Comparison of predicted and actual scores throughout the 2021 Round 1 Richmond versus Carlton match, illustrating how the model's forecasts evolve as additional match information becomes available.*
 
-[View the home win probability plot](figures/diffswinprob_richcarl.pdf)
+[Home win probability plot](figures/diffswinprob_richcarl.pdf)
 
 *Figure 5: Evolution of the home team's win probability throughout the 2021 Round 1 Richmond versus Carlton match, estimated through repeated simulations of the remaining match.*
 
@@ -101,13 +101,13 @@ Overall, the results highlight a trade-off between adapting to current-match inf
 
 #### Forecast Bias by Checkpoint
 
-[View the forecast bias plots](figures/forecast_bias_by_checkpoint.pdf)
+[Forecast bias plots](figures/forecast_bias_by_checkpoint.pdf)
 
 *Figure 6: Comparison of forecast bias across quarter-time, half-time and three-quarter-time checkpoints, illustrating systematic differences between predicted and observed final scores.*
 
 #### Forecast MAE by Checkpoint
 
-[View the forecast MAE plots](figures/forecast_mae_by_checkpoint.pdf)
+[Forecast MAE plots](figures/forecast_mae_by_checkpoint.pdf)
 
 *Figure 7: Mean absolute error of final-score forecasts across quarter-time, half-time and three-quarter-time checkpoints, comparing the predictive accuracy of the forecasting approaches.*
 
